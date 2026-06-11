@@ -165,7 +165,8 @@ cursor = conn.cursor()
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
 COMPLAINT_STATE = {}  # {user_id: {mode, subject_key, teacher_key, text}}
-COMPLAINT_COOLDOWN_SECONDS = 300
+SUGGESTION_SPAM_LIMIT = 5
+SUGGESTION_BREAK_SECONDS = 300
 ADMIN_MANAGE_STATE = {}  # {user_id: {action, data}}
 COMPLAINT_MAX_LENGTH = 1000
 
@@ -617,9 +618,20 @@ def get_last_complaint_for_user(user_id: int):
     return cursor.fetchone()
 
 
-def complaint_allowed(user_id: int, message_text: str):
+def get_recent_suggestion_count(user_id: int) -> int:
+    since = (uz_now() - timedelta(seconds=SUGGESTION_BREAK_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM complaints
+        WHERE user_id = ? AND type = 'suggestion' AND created_at >= ?
+    """, (user_id, since))
+    return int(cursor.fetchone()[0] or 0)
+
+
+def complaint_allowed(user_id: int, message_text: str, complaint_type: str = "general"):
     """
     Shikoyat/taklif spam himoyasi.
+    Taklifda ketma-ket 5 ta xabardan keyin 5 daqiqa tanaffus beriladi.
     True, '' qaytarilsa yuborish mumkin. Aks holda False va xabar matni qaytadi.
     """
     text = (message_text or "").strip()
@@ -627,22 +639,15 @@ def complaint_allowed(user_id: int, message_text: str):
         return False, f"Xabar juda uzun. Iltimos, {COMPLAINT_MAX_LENGTH} ta belgidan oshirmang."
 
     last = get_last_complaint_for_user(user_id)
-    if not last:
-        return True, ""
+    if last:
+        last_text, _created_at = last
+        if (last_text or "").strip() == text:
+            return False, "Siz aynan shu xabarni avval yuborgansiz. Iltimos, takroriy xabar yubormang."
 
-    last_text, created_at = last
-    if (last_text or "").strip() == text:
-        return False, "Siz aynan shu xabarni avval yuborgansiz. Iltimos, takroriy xabar yubormang."
-
-    try:
-        last_dt = datetime.strptime(created_at or "", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UZ_TZ)
-        diff = (uz_now() - last_dt).total_seconds()
-        if diff < COMPLAINT_COOLDOWN_SECONDS:
-            wait_seconds = int(COMPLAINT_COOLDOWN_SECONDS - diff)
-            minutes = max(1, (wait_seconds + 59) // 60)
-            return False, f"Spamdan himoya uchun keyingi murojaatni taxminan {minutes} daqiqadan keyin yuboring."
-    except Exception:
-        pass
+    if complaint_type == "suggestion":
+        recent_count = get_recent_suggestion_count(user_id)
+        if recent_count >= SUGGESTION_SPAM_LIMIT:
+            return False, "Takliflar uchun spam limiti: 5 ta xabardan keyin 5 daqiqa tanaffus qiling."
 
     return True, ""
 
@@ -674,14 +679,19 @@ def get_complaints_text(user_id: int) -> str:
         return tr(user_id, "📩 <b>Shikoyat va takliflar</b>\n\nHali hech qanday xabar kelmagan.")
 
     lines = [f"📩 <b>Shikoyat va takliflar</b>\n\nJami: {total} ta\nOxirgi {len(rows)} ta xabar:\n"]
-    for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
+    for i, (cid, uid, full_name, username, complaint_type, subject_key, teacher_key, message_text, created_at) in enumerate(rows, start=1):
         safe_name = escape(full_name or "Noma'lum")
         safe_username = escape(username or "")
         safe_message = escape(message_text or "")
-        line = f"{i}. <b>{safe_name}</b>"
+        type_label = "O'qituvchi ustidan shikoyat" if complaint_type == "teacher_complaint" else "Taklif" if complaint_type == "suggestion" else "Murojaat"
+        line = f"{i}. <b>{escape(type_label)}</b> — <b>{safe_name}</b>"
         if safe_username:
             line += f" (@{safe_username})"
         line += f"\n   ID: <code>{uid}</code>"
+        if subject_key:
+            line += f"\n   Kafedra: {escape(get_subject_name(subject_key))}"
+        if teacher_key:
+            line += f"\n   O'qituvchi: {escape(get_teacher_name(subject_key, teacher_key))}"
         line += f"\n   Sana: {escape(created_at or '')}"
         line += f"\n   Xabar: {safe_message}"
         lines.append(line)
@@ -1730,20 +1740,43 @@ def teacher_stats_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMark
 
 def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
-    kb.row(InlineKeyboardButton(text="🥇 TOP 10 ovoz bo'yicha", callback_data="admin_top_votes_menu"))
-    kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
+    kb.row(InlineKeyboardButton(text="🥇 TOP 10 natijalar", callback_data="admin_top_votes_menu"))
     kb.row(InlineKeyboardButton(text="👤 O'qituvchi statistikasi", callback_data="admin_teacher_stats"))
-    kb.row(InlineKeyboardButton(text="📩 Shikoyat/takliflar", callback_data="admin_complaints"))
-    kb.row(InlineKeyboardButton(text="📁 Excel ovozlar", callback_data="admin_export_votes_excel"))
-    kb.row(
-        InlineKeyboardButton(text="🔓 Open", callback_data="admin_open"),
-        InlineKeyboardButton(text="🔒 Close", callback_data="admin_close")
-    )
-    kb.row(InlineKeyboardButton(text="♻️ Reset ovozlar", callback_data="admin_reset_votes_confirm"))
-    kb.row(InlineKeyboardButton(text="🧹 Shikoyatlarni tozalash", callback_data="admin_reset_complaints_confirm"))
+    kb.row(InlineKeyboardButton(text="📩 Shikoyat va takliflar", callback_data="admin_complaints"))
+    kb.row(InlineKeyboardButton(text="🧹 Tozalash", callback_data="admin_cleanup_menu"))
+    kb.row(InlineKeyboardButton(text="📥 Ma'lumotlarni yuklab olish", callback_data="admin_download_menu"))
+    kb.row(InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="admin_settings_menu"))
+    return kb.as_markup()
+
+
+def admin_cleanup_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="♻️ Ovozlarni tozalash", callback_data="admin_reset_votes_confirm"))
+    kb.row(InlineKeyboardButton(text="🧹 Shikoyat/takliflarni tozalash", callback_data="admin_reset_complaints_confirm"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    return kb.as_markup()
+
+
+def admin_download_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📁 Ovozlar Excel", callback_data="admin_export_votes_excel"))
+    kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar Excel", callback_data="admin_export_users_excel"))
+    kb.row(InlineKeyboardButton(text="📄 Shikoyat/takliflar Word", callback_data="admin_export_complaints_docx"))
     kb.row(InlineKeyboardButton(text="💾 Backup", callback_data="admin_backup"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    return kb.as_markup()
+
+
+def admin_settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🔓 Ovoz berishni ochish", callback_data="admin_open"),
+        InlineKeyboardButton(text="🔒 Ovoz berishni yopish", callback_data="admin_close")
+    )
+    kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
     kb.row(InlineKeyboardButton(text="⚙️ Bo'lim va o'qituvchilarni boshqarish", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardMarkup:
@@ -2087,7 +2120,7 @@ async def confirm_complaint_send_handler(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Yuboriladigan matn topilmadi."), show_alert=True)
         return
     text = state.get("text", "")
-    allowed, reason = complaint_allowed(user_id, text)
+    allowed, reason = complaint_allowed(user_id, text, state.get("mode", "general"))
     if not allowed:
         await callback.answer(tr(user_id, reason), show_alert=True)
         return
@@ -2427,6 +2460,33 @@ async def back_admin_panel_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_cleanup_menu")
+async def admin_cleanup_menu_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(callback, "🧹 <b>Tozalash</b>\n\nQaysi ma'lumotlarni tozalamoqchisiz?", admin_cleanup_menu_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_download_menu")
+async def admin_download_menu_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(callback, "📥 <b>Ma'lumotlarni yuklab olish</b>\n\nKerakli fayl turini tanlang:", admin_download_menu_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_settings_menu")
+async def admin_settings_menu_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(callback, "⚙️ <b>Sozlamalar</b>\n\nKerakli bo'limni tanlang:", admin_settings_menu_keyboard(user_id))
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_results")
