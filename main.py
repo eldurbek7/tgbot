@@ -1679,6 +1679,7 @@ def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in get_subjects_from_db().items():
         kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_results_admin:{subject_key}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
@@ -1704,6 +1705,8 @@ def results_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data=f"refresh_results_admin:{scope}"),
         InlineKeyboardButton(text=tr(user_id, "📂 Bo'limlar"), callback_data="admin_results")
     )
+    kb.row(InlineKeyboardButton(text="⬅️ Ovoz natijalari", callback_data="admin_results"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
@@ -1884,6 +1887,7 @@ def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_users"),
         InlineKeyboardButton(text="📊 Excel", callback_data="admin_export_users_excel")
     )
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
@@ -2476,6 +2480,26 @@ async def admin_settings_menu_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "⚙️ <b>Sozlamalar</b>\n\nKerakli bo'limni tanlang:", admin_settings_menu_keyboard(user_id))
     await callback.answer()
 
+@dp.callback_query(F.data == "admin_open")
+async def admin_open_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    open_voting()
+    await safe_edit_message(callback, "🟢 <b>Ovoz berish ochildi.</b>\n\n⚙️ Sozlamalarga qaytishingiz mumkin.", admin_settings_menu_keyboard(user_id))
+    await callback.answer("Ovoz berish ochildi")
+
+@dp.callback_query(F.data == "admin_close")
+async def admin_close_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    close_voting()
+    await safe_edit_message(callback, "🔴 <b>Ovoz berish yopildi.</b>\n\n⚙️ Sozlamalarga qaytishingiz mumkin.", admin_settings_menu_keyboard(user_id))
+    await callback.answer("Ovoz berish yopildi")
+
 @dp.callback_query(F.data == "admin_results")
 async def admin_results_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2595,6 +2619,7 @@ async def admin_top_votes_callback(callback: CallbackQuery):
         return
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes"))
+    kb.row(InlineKeyboardButton(text="⬅️ TOP menyusi", callback_data="admin_top_votes_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     async with db_lock:
         text = add_refresh_time(get_top_votes_text(user_id), user_id)
@@ -2919,6 +2944,7 @@ def admin_manage_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🏫 Bo'limlarni boshqarish", callback_data="manage_subjects"),
         InlineKeyboardButton(text="👨‍🏫 O'qituvchilarni boshqarish", callback_data="manage_teachers_select_subject")
     )
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
@@ -2929,6 +2955,8 @@ def manage_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
         kb.row(InlineKeyboardButton(text=f"📂 {sdata['name']}", callback_data=f"manage_subject_actions:{skey}"))
     kb.row(InlineKeyboardButton(text="➕ Yangi bo'lim qo'shish", callback_data="manage_subject_add"))
     kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def manage_subject_actions_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
@@ -2938,6 +2966,9 @@ def manage_subject_actions_keyboard(user_id: int, subject_key: str) -> InlineKey
         InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"manage_subject_delete_confirm:{subject_key}")
     )
     kb.row(InlineKeyboardButton(text="⬅️ Bo'limlar", callback_data="manage_subjects"))
+    kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def manage_teachers_select_subject_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -2946,6 +2977,8 @@ def manage_teachers_select_subject_keyboard(user_id: int) -> InlineKeyboardMarku
     for skey, sdata in subjects.items():
         kb.row(InlineKeyboardButton(text=sdata['name'], callback_data=f"manage_teachers:{skey}"))
     kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def manage_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
@@ -2956,6 +2989,9 @@ def manage_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMa
         kb.row(InlineKeyboardButton(text=tname, callback_data=f"manage_teacher_actions:{subject_key}:{tkey}"))
     kb.row(InlineKeyboardButton(text="➕ Yangi o'qituvchi qo'shish", callback_data=f"manage_teacher_add:{subject_key}"))
     kb.row(InlineKeyboardButton(text="⬅️ Bo'limlar", callback_data="manage_teachers_select_subject"))
+    kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def manage_teacher_actions_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
@@ -2966,11 +3002,16 @@ def manage_teacher_actions_keyboard(user_id: int, subject_key: str, teacher_key:
     )
     kb.row(InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"manage_teacher_delete_confirm:{subject_key}:{teacher_key}"))
     kb.row(InlineKeyboardButton(text="⬅️ O'qituvchilar", callback_data=f"manage_teachers:{subject_key}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Bo'limlar", callback_data="manage_teachers_select_subject"))
+    kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 def manage_cancel_keyboard(user_id: int, back_cb: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga / Bekor qilish", callback_data=back_cb))
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
