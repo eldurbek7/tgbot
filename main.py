@@ -413,6 +413,12 @@ def init_db():
     _sync_subjects_to_db()
     if get_setting("voting_open", "") == "":
         set_setting("voting_open", "1")
+    if get_setting("auto_voting_enabled", "") == "":
+        set_setting("auto_voting_enabled", "0")
+    if get_setting("auto_voting_start", "") == "":
+        set_setting("auto_voting_start", "09:00")
+    if get_setting("auto_voting_end", "") == "":
+        set_setting("auto_voting_end", "18:00")
 
 
 def _sync_subjects_to_db():
@@ -519,6 +525,74 @@ def open_voting():
 
 def close_voting():
     set_setting("voting_open", "0")
+
+
+def is_auto_voting_enabled() -> bool:
+    return get_setting("auto_voting_enabled", "0") == "1"
+
+
+def set_auto_voting_enabled(enabled: bool):
+    set_setting("auto_voting_enabled", "1" if enabled else "0")
+
+
+def get_auto_voting_start() -> str:
+    return get_setting("auto_voting_start", "09:00")
+
+
+def get_auto_voting_end() -> str:
+    return get_setting("auto_voting_end", "18:00")
+
+
+def parse_hhmm(value: str) -> Optional[tuple[int, int]]:
+    value = (value or "").strip()
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def set_auto_voting_schedule(start_time: str, end_time: str) -> bool:
+    if not parse_hhmm(start_time) or not parse_hhmm(end_time):
+        return False
+    set_setting("auto_voting_start", start_time.strip())
+    set_setting("auto_voting_end", end_time.strip())
+    return True
+
+
+def should_auto_voting_be_open(now: Optional[datetime] = None) -> bool:
+    now = now or uz_now()
+    start = parse_hhmm(get_auto_voting_start()) or (9, 0)
+    end = parse_hhmm(get_auto_voting_end()) or (18, 0)
+    current_minutes = now.hour * 60 + now.minute
+    start_minutes = start[0] * 60 + start[1]
+    end_minutes = end[0] * 60 + end[1]
+
+    if start_minutes == end_minutes:
+        return True  # 00:00-00:00 kabi bir xil vaqt 24 soat ochiq deb olinadi
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+def apply_auto_voting_status() -> bool:
+    """Avtomatik rejim yoqilgan bo'lsa, vaqtga qarab ovozni ochadi/yopadi."""
+    if not is_auto_voting_enabled():
+        return False
+    target_open = should_auto_voting_be_open()
+    current_open = is_voting_open()
+    if target_open != current_open:
+        set_setting("voting_open", "1" if target_open else "0")
+        logging.info("Auto voting status changed: %s", "open" if target_open else "closed")
+    return target_open
+
+
+async def auto_voting_scheduler():
+    while True:
+        try:
+            apply_auto_voting_status()
+        except Exception as e:
+            logging.exception("Auto voting scheduler xatosi: %s", e)
+        await asyncio.sleep(30)
 
 
 def has_voted(user_id: int) -> bool:
@@ -1918,9 +1992,12 @@ def admin_download_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def admin_settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(text="🔓 Ovoz berishni ochish", callback_data="admin_open"),
-        InlineKeyboardButton(text="🔒 Ovoz berishni yopish", callback_data="admin_close")
+        InlineKeyboardButton(text="🔓 Manual ochish", callback_data="admin_open"),
+        InlineKeyboardButton(text="🔒 Manual yopish", callback_data="admin_close")
     )
+    auto_button = "🔴 Avto rejimni o'chirish" if is_auto_voting_enabled() else "🟢 Avto rejimni yoqish"
+    kb.row(InlineKeyboardButton(text=auto_button, callback_data="admin_auto_voting_toggle"))
+    kb.row(InlineKeyboardButton(text="⏰ Avto vaqtni belgilash", callback_data="admin_auto_voting_set_time"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
     kb.row(InlineKeyboardButton(text="⚙️ Bo'lim va o'qituvchilarni boshqarish", callback_data="admin_manage_menu"))
     kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
@@ -2698,9 +2775,13 @@ async def admin_download_menu_callback(callback: CallbackQuery):
 def get_admin_settings_text(user_id: int) -> str:
     status_icon = "🟢" if is_voting_open() else "🔴"
     status_text = "Ochiq" if is_voting_open() else "Yopiq"
+    auto_icon = "🟢" if is_auto_voting_enabled() else "🔴"
+    auto_text = "Yoqilgan" if is_auto_voting_enabled() else "O'chirilgan"
     return (
         "⚙️ <b>Sozlamalar</b>\n\n"
-        f"{status_icon} <b>Ovoz berish holati:</b> {status_text}\n\n"
+        f"{status_icon} <b>Ovoz berish holati:</b> {status_text}\n"
+        f"{auto_icon} <b>Avtomatik rejim:</b> {auto_text}\n"
+        f"⏰ <b>Avto vaqt:</b> {get_auto_voting_start()} - {get_auto_voting_end()}\n\n"
         "Kerakli bo'limni tanlang:"
     )
 
@@ -2735,6 +2816,41 @@ async def admin_close_callback(callback: CallbackQuery):
     close_voting()
     await safe_edit_message(callback, get_admin_settings_text(user_id), admin_settings_menu_keyboard(user_id))
     await callback.answer("Ovoz berish yopildi")
+
+
+@dp.callback_query(F.data == "admin_auto_voting_toggle")
+async def admin_auto_voting_toggle_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    enabled = not is_auto_voting_enabled()
+    set_auto_voting_enabled(enabled)
+    if enabled:
+        apply_auto_voting_status()
+    await safe_edit_message(callback, get_admin_settings_text(user_id), admin_settings_menu_keyboard(user_id))
+    await callback.answer("Avtomatik rejim yoqildi" if enabled else "Avtomatik rejim o'chirildi")
+
+
+@dp.callback_query(F.data == "admin_auto_voting_set_time")
+async def admin_auto_voting_set_time_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    ADMIN_MANAGE_STATE[user_id] = {"action": "set_auto_voting_time"}
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    await safe_edit_message(
+        callback,
+        "⏰ <b>Avtomatik ovoz vaqtini belgilang</b>\n\n"
+        "Format: <code>09:00-18:00</code> yoki <code>09:00 18:00</code>\n"
+        "Masalan: <code>08:30-17:45</code>\n\n"
+        "Agar vaqt kechadan ertaga o'tsa, masalan <code>22:00-06:00</code>, bot shu oraliqda ochiq turadi.",
+        kb.as_markup()
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "admin_results")
@@ -3714,6 +3830,30 @@ async def text_handler(message: Message):
             )
             return
 
+        elif action == "set_auto_voting_time":
+            cleaned = text.replace("—", "-").replace("–", "-").replace("dan", " ").replace("gacha", " ")
+            parts = re.findall(r"([01]?\d|2[0-3]):([0-5]\d)", cleaned)
+            if len(parts) < 2:
+                ADMIN_MANAGE_STATE[user_id] = state
+                await message.answer(
+                    "❌ Format noto'g'ri. Masalan: <code>09:00-18:00</code>",
+                    parse_mode="HTML",
+                    reply_markup=manage_cancel_keyboard(user_id, "admin_settings_menu")
+                )
+                return
+            start_time = f"{int(parts[0][0]):02d}:{parts[0][1]}"
+            end_time = f"{int(parts[1][0]):02d}:{parts[1][1]}"
+            async with db_lock:
+                set_auto_voting_schedule(start_time, end_time)
+                if is_auto_voting_enabled():
+                    apply_auto_voting_status()
+            await message.answer(
+                f"✅ Avtomatik vaqt saqlandi: <b>{start_time} - {end_time}</b>",
+                parse_mode="HTML",
+                reply_markup=admin_settings_menu_keyboard(user_id)
+            )
+            return
+
     if user_id in WAITING_COMPLAINT_TEXT:
         text = (message.text or "").strip()
         if not text:
@@ -3747,6 +3887,7 @@ async def text_handler(message: Message):
 # =========================
 async def main():
     init_db()
+    asyncio.create_task(auto_voting_scheduler())
     logging.info("Bot ishga tushdi. PostgreSQL baza ulandi.")
     await dp.start_polling(bot)
 
