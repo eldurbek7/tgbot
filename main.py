@@ -4,14 +4,13 @@ import re
 import asyncio
 import logging
 import zipfile
-try:
-    import psycopg2
-    import psycopg2.errors
-except ImportError:
-    psycopg2 = None
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+from psycopg2 import IntegrityError as PgIntegrityError
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
@@ -41,10 +40,13 @@ except ImportError:
 # =========================
 # SOZLAMALAR
 # =========================
-# FIX #1: Token faqat env dan olinadi, kodga yozilmaydi
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi. Iltimos, BOT_TOKEN ni o'rnating.")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL muhit o'zgaruvchisi topilmadi. Iltimos, Railway PostgreSQL DATABASE_URL ni o'rnating.")
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Qashqadaryo_PMM")
 CHANNEL_URL = "https://t.me/Qashqadaryo_PMM"
@@ -58,14 +60,13 @@ INSTAGRAM_URL = "https://www.instagram.com/pedagogikmahorat"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_NAME = os.path.join(DATA_DIR, "votes.db")
 EXPORT_FILE = os.path.join(DATA_DIR, "votes_export.csv")
 VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
 RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
 USERS_XLSX_FILE = os.path.join(DATA_DIR, "users_export.xlsx")
-# FIX #8: Ikki xil nom o'rniga bitta nom
 COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
 BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
+SUBJECTS_RANKING_XLSX_FILE = os.path.join(DATA_DIR, "subjects_ranking_export.xlsx")
 
 SUBJECTS = {
     "s1": {
@@ -164,78 +165,17 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL muhit o'zgaruvchisi topilmadi. Railway PostgreSQL ulanishini tekshiring.")
-
-if psycopg2 is None:
-    raise RuntimeError("psycopg2-binary o'rnatilmagan. requirements.txt ga psycopg2-binary qo'shing.")
-
-
-class SmartCursor:
-    """
-    SQLite uslubidagi eski SQL so'rovlarni PostgreSQL uchun moslab bajaradi.
-    Bu bot logikasini o'zgartirmasdan Railway PostgreSQL bilan ishlashini ta'minlaydi.
-    """
-    def __init__(self, connection):
-        self.connection = connection
-        self._cursor = connection.cursor()
-        self.rowcount = -1
-
-    def _translate_sql(self, sql: str) -> str:
-        q = sql
-        q = q.replace("?", "%s")
-        q = q.replace("id INTEGER PRIMARY KEY AUTOINCREMENT", "id SERIAL PRIMARY KEY")
-        q = q.replace("user_id INTEGER", "user_id BIGINT")
-        q = q.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-        if "INSERT INTO db_subjects" in q and "ON CONFLICT" not in q:
-            q += " ON CONFLICT (subject_key) DO NOTHING"
-        if "INSERT INTO db_teachers" in q and "ON CONFLICT" not in q:
-            q += " ON CONFLICT (subject_key, teacher_key) DO NOTHING"
-        return q
-
-    def execute(self, sql: str, params=()):
-        q = self._translate_sql(sql)
-        try:
-            self._cursor.execute(q, params)
-        except psycopg2.errors.DuplicateColumn:
-            # ALTER TABLE ADD COLUMN qayta ishlaganda ustun bor bo'lsa, davom etamiz.
-            self.connection.rollback()
-            self._cursor = self.connection.cursor()
-            self.rowcount = 0
-            return self
-        self.rowcount = self._cursor.rowcount
-        return self
-
-    def fetchone(self):
-        return self._cursor.fetchone()
-
-    def fetchall(self):
-        return self._cursor.fetchall()
-
-
-def make_db_connection():
-    pg_conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
-    pg_conn.autocommit = True
-    return pg_conn, SmartCursor(pg_conn)
-
-
-conn, cursor = make_db_connection()
-DBIntegrityError = (psycopg2.IntegrityError,)
-DBOperationalError = (psycopg2.Error,)
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
-COMPLAINT_STATE = {}  # {user_id: {mode, subject_key, teacher_key, text}}
+COMPLAINT_STATE = {}
 SUGGESTION_SPAM_LIMIT = 5
 SUGGESTION_BREAK_SECONDS = 300
-ADMIN_MANAGE_STATE = {}  # {user_id: {action, data}}
+ADMIN_MANAGE_STATE = {}
 COMPLAINT_MAX_LENGTH = 1000
 
-# Refresh tugmalarini ketma-ket bosishdan himoya
 LAST_REFRESH = {}
 REFRESH_BUSY = set()
 REFRESH_COOLDOWN_SECONDS = 1.5
-
 
 # =========================
 # O'ZBEKISTON VAQTI
@@ -246,15 +186,58 @@ def uz_now() -> datetime:
     return datetime.now(UZ_TZ)
 
 # =========================
+# POSTGRESQL ULANISH
+# =========================
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+def execute_query(sql: str, params=None, fetch: str = None):
+    """
+    fetch = None  -> faqat execute (INSERT/UPDATE/DELETE)
+    fetch = 'one' -> fetchone()
+    fetch = 'all' -> fetchall()
+    """
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                if fetch == 'one':
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+                elif fetch == 'all':
+                    rows = cur.fetchall()
+                    return [dict(r) for r in rows]
+                else:
+                    return cur.rowcount
+    finally:
+        conn.close()
+
+def execute_query_plain(sql: str, params=None, fetch: str = None):
+    """RealDictCursor emas, oddiy tuple cursor ishlatadi."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                if fetch == 'one':
+                    return cur.fetchone()
+                elif fetch == 'all':
+                    return cur.fetchall()
+                else:
+                    return cur.rowcount
+    finally:
+        conn.close()
+
+# =========================
 # LOTIN / KRILL
 # =========================
 def latin_to_cyrillic_text(text: str) -> str:
-    # FIX #4: Takrorlangan juftlar olib tashlandi, to'g'ri tartib saqlandi
     pairs = [
-        ("O\u2018", "\u040e"), ("o\u2018", "\u045e"),   # O' → Ў (unicode apostrof)
-        ("G\u2018", "\u0492"), ("g\u2018", "\u0493"),   # G' → Ғ
-        ("O'", "\u040e"), ("o'", "\u045e"),              # O' → Ў (oddiy apostrof)
-        ("G'", "\u0492"), ("g'", "\u0493"),              # G' → Ғ
+        ("O\u2018", "\u040e"), ("o\u2018", "\u045e"),
+        ("G\u2018", "\u0492"), ("g\u2018", "\u0493"),
+        ("O'", "\u040e"), ("o'", "\u045e"),
+        ("G'", "\u0492"), ("g'", "\u0493"),
         ("Sh", "\u0428"), ("sh", "\u0448"),
         ("Ch", "\u0427"), ("ch", "\u0447"),
         ("Ya", "\u042f"), ("ya", "\u044f"),
@@ -308,8 +291,7 @@ def translit_html_safe(text: str, script: str) -> str:
 
 def get_user_script(user_id: int) -> str:
     ensure_user(user_id)
-    cursor.execute("SELECT script FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
+    row = execute_query_plain("SELECT script FROM user_prefs WHERE user_id = %s", (user_id,), fetch='one')
     return row[0] if row and row[0] in ("latin", "cyrillic") else "latin"
 
 
@@ -317,8 +299,7 @@ def set_user_script(user_id: int, script: str):
     ensure_user(user_id)
     if script not in ("latin", "cyrillic"):
         script = "latin"
-    cursor.execute("UPDATE user_prefs SET script = ? WHERE user_id = ?", (script, user_id))
-    conn.commit()
+    execute_query("UPDATE user_prefs SET script = %s WHERE user_id = %s", (script, user_id))
 
 
 def tr(user_id: int, text: str) -> str:
@@ -340,264 +321,287 @@ def normalize_subject_key(subject_key: str) -> str:
     return OLD_TO_NEW_SUBJECT.get(subject_key, subject_key)
 
 def init_db():
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS votes (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            voted_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            user_id INTEGER PRIMARY KEY,
-            script TEXT DEFAULT 'latin',
-            access_granted INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS teacher_ratings (
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
-            rated_at TEXT,
-            PRIMARY KEY (user_id, subject_key, teacher_key)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS complaints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            type TEXT DEFAULT 'general',
-            subject_key TEXT,
-            teacher_key TEXT,
-            message_text TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-    for col, definition in [
-        ("type", "TEXT DEFAULT 'general'"),
-        ("subject_key", "TEXT"),
-        ("teacher_key", "TEXT"),
-    ]:
-        try:
-            cursor.execute(f"ALTER TABLE complaints ADD COLUMN {col} {definition}")
-        except DBOperationalError:
-            pass
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS db_subjects (
-            subject_key TEXT PRIMARY KEY,
-            subject_name TEXT NOT NULL,
-            sort_order INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS db_teachers (
-            teacher_key TEXT NOT NULL,
-            subject_key TEXT NOT NULL,
-            teacher_name TEXT NOT NULL,
-            student_count INTEGER DEFAULT 0,
-            PRIMARY KEY (subject_key, teacher_key),
-            FOREIGN KEY (subject_key) REFERENCES db_subjects(subject_key)
-        )
-    """)
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        cursor.execute("ALTER TABLE db_teachers ADD COLUMN student_count INTEGER DEFAULT 0")
-    except DBOperationalError:
-        pass
-    conn.commit()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS votes (
+                        user_id BIGINT PRIMARY KEY,
+                        full_name TEXT,
+                        username TEXT,
+                        subject_key TEXT NOT NULL,
+                        teacher_key TEXT NOT NULL,
+                        voted_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_prefs (
+                        user_id BIGINT PRIMARY KEY,
+                        script TEXT DEFAULT 'latin',
+                        access_granted INTEGER DEFAULT 0
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS teacher_ratings (
+                        user_id BIGINT NOT NULL,
+                        full_name TEXT,
+                        username TEXT,
+                        subject_key TEXT NOT NULL,
+                        teacher_key TEXT NOT NULL,
+                        rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
+                        rated_at TEXT,
+                        PRIMARY KEY (user_id, subject_key, teacher_key)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS complaints (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        full_name TEXT,
+                        username TEXT,
+                        type TEXT DEFAULT 'general',
+                        subject_key TEXT,
+                        teacher_key TEXT,
+                        message_text TEXT NOT NULL,
+                        created_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS db_subjects (
+                        subject_key TEXT PRIMARY KEY,
+                        subject_name TEXT NOT NULL,
+                        sort_order INTEGER DEFAULT 0
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS db_teachers (
+                        teacher_key TEXT NOT NULL,
+                        subject_key TEXT NOT NULL,
+                        teacher_name TEXT NOT NULL,
+                        student_count INTEGER DEFAULT 0,
+                        PRIMARY KEY (subject_key, teacher_key)
+                    )
+                """)
+        conn.commit()
+    finally:
+        conn.close()
+
     migrate_old_subject_keys()
     _sync_subjects_to_db()
     if get_setting("voting_open", "") == "":
         set_setting("voting_open", "1")
 
+
 def _sync_subjects_to_db():
-    """SUBJECTS dict dan db_subjects/db_teachers ga birinchi marta sync qiladi."""
-    cursor.execute("SELECT COUNT(*) FROM db_subjects")
-    count = cursor.fetchone()[0]
+    row = execute_query_plain("SELECT COUNT(*) FROM db_subjects", fetch='one')
+    count = row[0] if row else 0
     if count == 0:
-        for i, (skey, sdata) in enumerate(SUBJECTS.items()):
-            cursor.execute(
-                "INSERT OR IGNORE INTO db_subjects (subject_key, subject_name, sort_order) VALUES (?, ?, ?)",
-                (skey, sdata["name"], i)
-            )
-            for tkey, tname in sdata["teachers"].items():
-                cursor.execute(
-                    "INSERT OR IGNORE INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (?, ?, ?)",
-                    (tkey, skey, tname)
-                )
-        conn.commit()
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    for i, (skey, sdata) in enumerate(SUBJECTS.items()):
+                        cur.execute(
+                            "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                            (skey, sdata["name"], i)
+                        )
+                        for tkey, tname in sdata["teachers"].items():
+                            cur.execute(
+                                "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                                (tkey, skey, tname)
+                            )
+        finally:
+            conn.close()
+
 
 def get_subjects_from_db() -> dict:
-    """DB dan bo'limlar va o'qituvchilarni oladi."""
-    cursor.execute("SELECT subject_key, subject_name FROM db_subjects ORDER BY sort_order, subject_key")
+    rows = execute_query_plain("SELECT subject_key, subject_name FROM db_subjects ORDER BY sort_order, subject_key", fetch='all')
     subjects = {}
-    for skey, sname in cursor.fetchall():
-        subjects[skey] = {"name": sname, "teachers": {}}
+    if rows:
+        for skey, sname in rows:
+            subjects[skey] = {"name": sname, "teachers": {}}
     for skey in subjects:
-        cursor.execute("SELECT teacher_key, teacher_name FROM db_teachers WHERE subject_key = ? ORDER BY teacher_key", (skey,))
-        for tkey, tname in cursor.fetchall():
-            subjects[skey]["teachers"][tkey] = tname
+        trows = execute_query_plain(
+            "SELECT teacher_key, teacher_name FROM db_teachers WHERE subject_key = %s ORDER BY teacher_key",
+            (skey,), fetch='all'
+        )
+        if trows:
+            for tkey, tname in trows:
+                subjects[skey]["teachers"][tkey] = tname
     return subjects
 
+
 def migrate_old_subject_keys():
-    for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
-        cursor.execute("UPDATE votes SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-        cursor.execute("UPDATE teacher_ratings SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-    conn.commit()
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
+                    cur.execute("UPDATE votes SET subject_key = %s WHERE subject_key = %s", (new_key, old_key))
+                    cur.execute("UPDATE teacher_ratings SET subject_key = %s WHERE subject_key = %s", (new_key, old_key))
+    finally:
+        conn.close()
+
 
 def get_setting(key: str, default: str = "") -> str:
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
+    row = execute_query_plain("SELECT value FROM settings WHERE key = %s", (key,), fetch='one')
     return row[0] if row else default
 
+
 def set_setting(key: str, value: str):
-    cursor.execute("""
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
-    conn.commit()
+    execute_query(
+        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value)
+    )
+
 
 def ensure_user(user_id: int):
-    cursor.execute("""
-        INSERT INTO user_prefs (user_id, script, access_granted)
-        VALUES (?, 'latin', 0)
-        ON CONFLICT(user_id) DO NOTHING
-    """, (user_id,))
-    conn.commit()
+    execute_query(
+        "INSERT INTO user_prefs (user_id, script, access_granted) VALUES (%s, 'latin', 0) ON CONFLICT (user_id) DO NOTHING",
+        (user_id,)
+    )
+
 
 def has_access(user_id: int) -> bool:
     ensure_user(user_id)
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
+    row = execute_query_plain("SELECT access_granted FROM user_prefs WHERE user_id = %s", (user_id,), fetch='one')
     return bool(row[0]) if row else False
+
 
 def require_access_only(user_id: int) -> bool:
     return has_access(user_id)
 
+
 def grant_access(user_id: int):
     ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    execute_query("UPDATE user_prefs SET access_granted = 1 WHERE user_id = %s", (user_id,))
+
 
 def reset_access(user_id: int):
     ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 0 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    execute_query("UPDATE user_prefs SET access_granted = 0 WHERE user_id = %s", (user_id,))
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+
 def is_voting_open() -> bool:
     return get_setting("voting_open", "1") == "1"
+
 
 def open_voting():
     set_setting("voting_open", "1")
 
+
 def close_voting():
     set_setting("voting_open", "0")
 
+
 def has_voted(user_id: int) -> bool:
-    cursor.execute("SELECT 1 FROM votes WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
+    row = execute_query_plain("SELECT 1 FROM votes WHERE user_id = %s", (user_id,), fetch='one')
+    return row is not None
+
 
 def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
-    """
-    Ovoz saqlaydi.
-    True  = ovoz muvaffaqiyatli saqlandi.
-    False = foydalanuvchi oldin ovoz bergan yoki PRIMARY KEY to'qnashuvi bo'lgan.
-    """
     subject_key = normalize_subject_key(subject_key)
-
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        cursor.execute("""
-            INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            full_name,
-            username,
-            subject_key,
-            teacher_key,
-            uz_now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        conn.commit()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (user_id, full_name, username, subject_key, teacher_key, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
+                )
         return True
-    except DBIntegrityError:
+    except PgIntegrityError:
+        conn.rollback()
         return False
+    finally:
+        conn.close()
 
-# FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
+
 def get_total_votes(subject_key: Optional[str] = None) -> int:
     if subject_key:
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (normalize_subject_key(subject_key),))
+        row = execute_query_plain(
+            "SELECT COUNT(*) FROM votes WHERE subject_key = %s",
+            (normalize_subject_key(subject_key),), fetch='one'
+        )
     else:
-        cursor.execute("SELECT COUNT(*) FROM votes")
-    return cursor.fetchone()[0]
+        row = execute_query_plain("SELECT COUNT(*) FROM votes", fetch='one')
+    return row[0] if row else 0
+
 
 def reset_votes():
-    cursor.execute("DELETE FROM votes")
-    conn.commit()
+    execute_query("DELETE FROM votes")
+
 
 def reset_ratings():
-    cursor.execute("DELETE FROM teacher_ratings")
-    conn.commit()
+    execute_query("DELETE FROM teacher_ratings")
+
 
 def reset_complaints():
-    cursor.execute("DELETE FROM complaints")
-    conn.commit()
+    execute_query("DELETE FROM complaints")
+
 
 def get_subject_name(subject_key: str) -> str:
     subject_key = normalize_subject_key(subject_key)
-    cursor.execute("SELECT subject_name FROM db_subjects WHERE subject_key = ?", (subject_key,))
-    row = cursor.fetchone()
+    row = execute_query_plain("SELECT subject_name FROM db_subjects WHERE subject_key = %s", (subject_key,), fetch='one')
     if row:
         return row[0]
     return SUBJECTS.get(subject_key, {}).get("name", subject_key)
 
+
 def get_teacher_name(subject_key: str, teacher_key: str) -> str:
     subject_key = normalize_subject_key(subject_key)
-    cursor.execute("SELECT teacher_name FROM db_teachers WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    row = cursor.fetchone()
+    row = execute_query_plain(
+        "SELECT teacher_name FROM db_teachers WHERE subject_key = %s AND teacher_key = %s",
+        (subject_key, teacher_key), fetch='one'
+    )
     if row:
         return row[0]
     return SUBJECTS.get(subject_key, {}).get("teachers", {}).get(teacher_key, teacher_key)
+
 
 def build_progress_bar(percent: float, length: int = 14) -> str:
     filled = round((percent / 100) * length)
     filled = max(0, min(filled, length))
     return "▓" * filled + "░" * (length - filled)
 
+
 def get_teacher_student_count(subject_key: str, teacher_key: str) -> int:
     subject_key = normalize_subject_key(subject_key)
-    cursor.execute("SELECT COALESCE(student_count, 0) FROM db_teachers WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    row = cursor.fetchone()
+    row = execute_query_plain(
+        "SELECT COALESCE(student_count, 0) FROM db_teachers WHERE subject_key = %s AND teacher_key = %s",
+        (subject_key, teacher_key), fetch='one'
+    )
     return int(row[0] or 0) if row else 0
+
 
 def set_teacher_student_count(subject_key: str, teacher_key: str, student_count: int) -> bool:
     subject_key = normalize_subject_key(subject_key)
     student_count = max(0, int(student_count))
-    cursor.execute("UPDATE db_teachers SET student_count = ? WHERE subject_key = ? AND teacher_key = ?", (student_count, subject_key, teacher_key))
-    conn.commit()
-    return cursor.rowcount > 0
+    rowcount = execute_query(
+        "UPDATE db_teachers SET student_count = %s WHERE subject_key = %s AND teacher_key = %s",
+        (student_count, subject_key, teacher_key)
+    )
+    return rowcount > 0
+
 
 def get_teacher_participation_percent(subject_key: str, teacher_key: str, vote_count: int) -> float:
     student_count = get_teacher_student_count(subject_key, teacher_key)
     return get_vote_percent(vote_count, student_count) if student_count else 0.0
+
 
 def get_all_teachers_flat():
     items = []
@@ -607,51 +611,58 @@ def get_all_teachers_flat():
             items.append((subject_key, teacher_key, teacher_name))
     return items
 
+
 def get_active_subjects() -> dict:
     return get_subjects_from_db()
+
 
 # =========================
 # RATING DB / STATS
 # =========================
 def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str, rating: str):
     subject_key = normalize_subject_key(subject_key)
-    cursor.execute("""
+    execute_query(
+        """
         INSERT INTO teacher_ratings (user_id, full_name, username, subject_key, teacher_key, rating, rated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, subject_key, teacher_key)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, subject_key, teacher_key)
         DO UPDATE SET
-            full_name = excluded.full_name,
-            username = excluded.username,
-            rating = excluded.rating,
-            rated_at = excluded.rated_at
-    """, (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
+            full_name = EXCLUDED.full_name,
+            username = EXCLUDED.username,
+            rating = EXCLUDED.rating,
+            rated_at = EXCLUDED.rated_at
+        """,
+        (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
 
-# FIX #9: Optional ishlatildi
+
 def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) -> Optional[str]:
-    cursor.execute("""
-        SELECT rating FROM teacher_ratings
-        WHERE user_id = ? AND subject_key = ? AND teacher_key = ?
-    """, (user_id, normalize_subject_key(subject_key), teacher_key))
-    row = cursor.fetchone()
+    row = execute_query_plain(
+        "SELECT rating FROM teacher_ratings WHERE user_id = %s AND subject_key = %s AND teacher_key = %s",
+        (user_id, normalize_subject_key(subject_key), teacher_key), fetch='one'
+    )
     return row[0] if row else None
 
+
 def get_rating_counts(subject_key: str, teacher_key: str):
-    cursor.execute("""
+    row = execute_query_plain(
+        """
         SELECT
             SUM(CASE WHEN rating = 'like' THEN 1 ELSE 0 END),
             SUM(CASE WHEN rating = 'dislike' THEN 1 ELSE 0 END),
             COUNT(*)
         FROM teacher_ratings
-        WHERE subject_key = ? AND teacher_key = ?
-    """, (normalize_subject_key(subject_key), teacher_key))
-    like_count, dislike_count, total = cursor.fetchone()
-    like_count = like_count or 0
-    dislike_count = dislike_count or 0
-    total = total or 0
+        WHERE subject_key = %s AND teacher_key = %s
+        """,
+        (normalize_subject_key(subject_key), teacher_key), fetch='one'
+    )
+    like_count = int(row[0] or 0) if row else 0
+    dislike_count = int(row[1] or 0) if row else 0
+    total = int(row[2] or 0) if row else 0
     like_percent = (like_count / total * 100) if total else 0
     dislike_percent = (dislike_count / total * 100) if total else 0
     return like_count, dislike_count, total, like_percent, dislike_percent
+
 
 def rating_rows():
     rows = []
@@ -670,60 +681,55 @@ def rating_rows():
         })
     return rows
 
+
 def get_vote_percent(count: int, denominator: int) -> float:
     return (count / denominator * 100) if denominator > 0 else 0.0
 
+
 def save_complaint(user_id: int, full_name: str, username: str, message_text: str, complaint_type: str = "general", subject_key: str = "", teacher_key: str = ""):
-    cursor.execute("""
+    execute_query(
+        """
         INSERT INTO complaints (user_id, full_name, username, type, subject_key, teacher_key, message_text, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        full_name,
-        username,
-        complaint_type,
-        normalize_subject_key(subject_key) if subject_key else "",
-        teacher_key or "",
-        message_text,
-        uz_now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-    conn.commit()
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            user_id,
+            full_name,
+            username,
+            complaint_type,
+            normalize_subject_key(subject_key) if subject_key else "",
+            teacher_key or "",
+            message_text,
+            uz_now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
 
 
 def get_last_complaint_for_user(user_id: int):
-    cursor.execute("""
-        SELECT message_text, created_at
-        FROM complaints
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (user_id,))
-    return cursor.fetchone()
+    row = execute_query_plain(
+        "SELECT message_text, created_at FROM complaints WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+        (user_id,), fetch='one'
+    )
+    return row
 
 
 def get_recent_suggestion_count(user_id: int) -> int:
     since = (uz_now() - timedelta(seconds=SUGGESTION_BREAK_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM complaints
-        WHERE user_id = ? AND type = 'suggestion' AND created_at >= ?
-    """, (user_id, since))
-    return int(cursor.fetchone()[0] or 0)
+    row = execute_query_plain(
+        "SELECT COUNT(*) FROM complaints WHERE user_id = %s AND type = 'suggestion' AND created_at >= %s",
+        (user_id, since), fetch='one'
+    )
+    return int(row[0] or 0) if row else 0
 
 
 def complaint_allowed(user_id: int, message_text: str, complaint_type: str = "general"):
-    """
-    Shikoyat/taklif spam himoyasi.
-    Taklifda ketma-ket 5 ta xabardan keyin 5 daqiqa tanaffus beriladi.
-    True, '' qaytarilsa yuborish mumkin. Aks holda False va xabar matni qaytadi.
-    """
     text = (message_text or "").strip()
     if len(text) > COMPLAINT_MAX_LENGTH:
         return False, f"Xabar juda uzun. Iltimos, {COMPLAINT_MAX_LENGTH} ta belgidan oshirmang."
 
     last = get_last_complaint_for_user(user_id)
     if last:
-        last_text, _created_at = last
+        last_text = last[0]
         if (last_text or "").strip() == text:
             return False, "Siz aynan shu xabarni avval yuborgansiz. Iltimos, takroriy xabar yubormang."
 
@@ -734,7 +740,7 @@ def complaint_allowed(user_id: int, message_text: str, complaint_type: str = "ge
 
     return True, ""
 
-# FIX #9: Optional ishlatildi
+
 def get_complaints_rows(limit: Optional[int] = None):
     sql = """
         SELECT id, user_id, full_name, username, type, subject_key, teacher_key, message_text, created_at
@@ -743,15 +749,14 @@ def get_complaints_rows(limit: Optional[int] = None):
     """
     params = ()
     if limit:
-        sql += " LIMIT ?"
+        sql += " LIMIT %s"
         params = (limit,)
-    cursor.execute(sql, params)
-    return cursor.fetchall()
+    return execute_query_plain(sql, params, fetch='all') or []
 
 
 def get_complaints_count() -> int:
-    cursor.execute("SELECT COUNT(*) FROM complaints")
-    return cursor.fetchone()[0]
+    row = execute_query_plain("SELECT COUNT(*) FROM complaints", fetch='one')
+    return row[0] if row else 0
 
 
 def get_complaints_text(user_id: int) -> str:
@@ -844,6 +849,7 @@ def export_complaints_to_docx() -> str:
 
     doc.save(COMPLAINTS_DOCX_FILE)
     return COMPLAINTS_DOCX_FILE
+
 
 def get_subscription_required_alert(user_id: int) -> str:
     return tr(user_id, "Avval Telegram kanalga obuna bo'ling va ✅ Tekshirish tugmasini bosing.")
@@ -947,7 +953,6 @@ def get_complaint_confirm_text(user_id: int, state: dict) -> str:
         info = ""
     return tr(user_id, f"❓ <b>Yuborishni tasdiqlaysizmi?</b>\n\n<b>Turi:</b> {title}\n{info}\n<b>Matn:</b>\n{text}")
 
-
 def get_complaint_saved_text(user_id: int) -> str:
     return tr(user_id, "✅ <b>Xabaringiz qabul qilindi.</b>\n\nRahmat, murojaatingiz adminlarga yuborildi.")
 
@@ -960,13 +965,12 @@ def get_admin_panel_text(user_id: int) -> str:
     return tr(user_id, f"🎛 <b>Admin panel</b>\n\nVoting holati: {status_text}\nJami ovozlar: {get_total_votes()}")
 
 def get_general_results_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, COUNT(*)
-        FROM votes
-        GROUP BY subject_key, teacher_key
-    """)
+    rows_db = execute_query_plain(
+        "SELECT subject_key, teacher_key, COUNT(*) FROM votes GROUP BY subject_key, teacher_key",
+        fetch='all'
+    ) or []
     counts = {}
-    for subject_key, teacher_key, count in cursor.fetchall():
+    for subject_key, teacher_key, count in rows_db:
         counts[(normalize_subject_key(subject_key), teacher_key)] = count
 
     total_votes = sum(counts.values())
@@ -996,16 +1000,14 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     if subject_key not in get_subjects_from_db():
         return tr(user_id, "Noto'g'ri kafedra.")
 
-    cursor.execute("""
-        SELECT teacher_key, COUNT(*)
-        FROM votes
-        WHERE subject_key = ?
-        GROUP BY teacher_key
-    """, (subject_key,))
-    subject_counts = {teacher_key: count for teacher_key, count in cursor.fetchall()}
+    rows_db = execute_query_plain(
+        "SELECT teacher_key, COUNT(*) FROM votes WHERE subject_key = %s GROUP BY teacher_key",
+        (subject_key,), fetch='all'
+    ) or []
+    subject_counts = {teacher_key: count for teacher_key, count in rows_db}
 
-    cursor.execute("SELECT COUNT(*) FROM votes")
-    total_votes = cursor.fetchone()[0]
+    total_votes_row = execute_query_plain("SELECT COUNT(*) FROM votes", fetch='one')
+    total_votes = total_votes_row[0] if total_votes_row else 0
     subject_total = sum(subject_counts.values())
 
     lines = [f"📊 <b>{get_subject_name(subject_key)} bo'yicha natijalar</b>\n"]
@@ -1030,7 +1032,6 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     return tr(user_id, text)
 
 
-# FIX #9: Optional ishlatildi
 def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> str:
     rows = rating_rows()
     if subject_key and subject_key != "general":
@@ -1049,6 +1050,7 @@ def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> st
         )
     text = "\n".join(lines)
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
+
 
 def get_top_ratings_text(user_id: int) -> str:
     rows = [r for r in rating_rows() if r["total"] > 0]
@@ -1073,26 +1075,28 @@ def get_top_ratings_text(user_id: int) -> str:
 
 
 def get_top_votes_text(user_id: int) -> str:
-    """TOP 10 o'qituvchilar — o'quvchilari soniga nisbatan ishtirok foizi bo'yicha."""
     items = []
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-        vote_count = cursor.fetchone()[0]
+        row = execute_query_plain(
+            "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+            (subject_key, teacher_key), fetch='one'
+        )
+        vote_count = row[0] if row else 0
         student_count = get_teacher_student_count(subject_key, teacher_key)
         participation = get_teacher_participation_percent(subject_key, teacher_key, vote_count)
         items.append((subject_key, teacher_key, teacher_name, vote_count, student_count, participation))
 
     items.sort(key=lambda x: (x[5], x[3]), reverse=True)
-    rows = items[:10]
+    top_rows = items[:10]
     total_votes = get_total_votes()
 
-    if not rows or all(r[3] == 0 for r in rows):
+    if not top_rows or all(r[3] == 0 for r in top_rows):
         return tr(user_id, "🥇 <b>TOP 10 — O'qituvchi natijalari</b>\n\nHali hech kim ovoz bermagan.")
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     lines = [f"🥇 <b>TOP 10 — O'quvchilari ovoz bergan foizi bo'yicha</b>\n\n🗳 Jami ovozlar: {total_votes}\n"]
 
-    for i, (subject_key, teacher_key, teacher_name, vote_count, student_count, percent) in enumerate(rows):
+    for i, (subject_key, teacher_key, teacher_name, vote_count, student_count, percent) in enumerate(top_rows):
         subject_name = get_subject_name(subject_key)
         bar = build_progress_bar(percent)
         medal = medals[i] if i < len(medals) else f"{i+1}."
@@ -1108,8 +1112,8 @@ def get_top_votes_text(user_id: int) -> str:
         text = text[:4000] + "\n\n... qisqartirildi"
     return tr(user_id, text)
 
+
 def get_top_votes_by_subject_text(user_id: int) -> str:
-    """Kafedralar natijasi — shu kafedradagi o'qituvchilar natijalarining o'rtachasi bo'yicha."""
     subjects = get_subjects_from_db()
     total_votes = get_total_votes()
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -1120,8 +1124,11 @@ def get_top_votes_by_subject_text(user_id: int) -> str:
         subject_vote_count = 0
         teachers = subject_data.get("teachers", {})
         for teacher_key, _teacher_name in teachers.items():
-            cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-            vote_count = cursor.fetchone()[0]
+            row = execute_query_plain(
+                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+                (subject_key, teacher_key), fetch='one'
+            )
+            vote_count = row[0] if row else 0
             subject_vote_count += vote_count
             teacher_results.append(get_teacher_participation_percent(subject_key, teacher_key, vote_count))
 
@@ -1153,14 +1160,15 @@ def get_top_votes_by_subject_text(user_id: int) -> str:
 
 
 def get_users_text(user_id: int) -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
+    rows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC",
+        fetch='all'
+    ) or []
     if not rows:
         return tr(user_id, "👥 Hali hech kim ovoz bermagan.")
     lines = [f"👥 <b>Kim kimga ovoz berdi</b>\n\nJami: {len(rows)} ta foydalanuvchi\n"]
     for i, (uid, full_name, username, subject_key, teacher_key, voted_at) in enumerate(rows, start=1):
         subject_key = normalize_subject_key(subject_key)
-        # FIX #3: f-string ichida apostrof xatosi — o'zgaruvchiga olindi
         name = full_name or "Noma'lum"
         line = f"{i}. <b>{name}</b>"
         if username:
@@ -1176,34 +1184,29 @@ def get_users_text(user_id: int) -> str:
 
 
 def get_my_vote_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE user_id = ?
-    """, (user_id,))
-    row = cursor.fetchone()
+    row = execute_query_plain(
+        "SELECT subject_key, teacher_key, voted_at FROM votes WHERE user_id = %s",
+        (user_id,), fetch='one'
+    )
     if not row:
         return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
 
-    subject_key, teacher_key, voted_at = row
+    subject_key, teacher_key, voted_at = row[0], row[1], row[2]
     subject_key = normalize_subject_key(subject_key)
     return tr(
         user_id,
         f"🧾 <b>Mening ovozim</b>\n\n"
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
         f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
-        f"<b>Sana:</b> {voted_at or 'Noma\'lum'}"
+        f"<b>Sana:</b> {voted_at or 'Noma\\'lum'}"
     )
 
 
 def get_my_ratings_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, rating, rated_at
-        FROM teacher_ratings
-        WHERE user_id = ?
-        ORDER BY rated_at DESC
-    """, (user_id,))
-    rows = cursor.fetchall()
+    rows = execute_query_plain(
+        "SELECT subject_key, teacher_key, rating, rated_at FROM teacher_ratings WHERE user_id = %s ORDER BY rated_at DESC",
+        (user_id,), fetch='all'
+    ) or []
     if not rows:
         return tr(user_id, "⭐️ <b>Mening baholarim</b>\n\nSiz hali o'qituvchilarga like/dislike bermagansiz.")
 
@@ -1228,8 +1231,11 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
     if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
         return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
 
-    cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    vote_count = cursor.fetchone()[0]
+    row = execute_query_plain(
+        "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+        (subject_key, teacher_key), fetch='one'
+    )
+    vote_count = row[0] if row else 0
     subject_total = get_total_votes(subject_key)
     total_votes = get_total_votes()
     vote_percent_subject = get_vote_percent(vote_count, subject_total)
@@ -1250,10 +1256,7 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
     )
 
 
-SUBJECTS_RANKING_XLSX_FILE = os.path.join(DATA_DIR, "subjects_ranking_export.xlsx")
-
 def export_subjects_ranking_to_excel() -> str:
-    """Kafedralarni o'qituvchilar natijalarining o'rtachasi bo'yicha Excel faylga eksport qiladi."""
     total_votes = get_total_votes()
     subjects = get_subjects_from_db()
 
@@ -1262,8 +1265,11 @@ def export_subjects_ranking_to_excel() -> str:
         teacher_rows = []
         subject_vote_count = 0
         for teacher_key, teacher_name in subject_data.get("teachers", {}).items():
-            cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-            vote_count = cursor.fetchone()[0]
+            row = execute_query_plain(
+                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+                (subject_key, teacher_key), fetch='one'
+            )
+            vote_count = row[0] if row else 0
             student_count = get_teacher_student_count(subject_key, teacher_key)
             percent = round(get_teacher_participation_percent(subject_key, teacher_key, vote_count), 2)
             subject_vote_count += vote_count
@@ -1287,14 +1293,14 @@ def export_subjects_ranking_to_excel() -> str:
 
     ws = wb.create_sheet("Kafedralar reytingi")
     ws_append_header(ws, ["O'rin", "Kafedra", "O'rtacha natija (%)", "Ovozlar soni", "O'qituvchilar soni", "Jami ovozlar"])
-    for rank, (subject_key, sname, avg_percent, vote_count, teacher_count, teacher_rows) in enumerate(subject_rows, start=1):
+    for rank, (subject_key, sname, avg_percent, vote_count, teacher_count, teacher_rows_data) in enumerate(subject_rows, start=1):
         ws.append([rank, sname, avg_percent, vote_count, teacher_count, total_votes if rank == 1 else ""])
 
-    for subject_key, sname, avg_percent, subject_vote_count, teacher_count, teacher_rows in subject_rows:
+    for subject_key, sname, avg_percent, subject_vote_count, teacher_count, teacher_rows_data in subject_rows:
         ws_sub = wb.create_sheet((sname[:28] + " natija")[:31])
         ws_append_header(ws_sub, ["O'rin", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Natija (%)"])
-        teacher_rows.sort(key=lambda x: (x[4], x[2]), reverse=True)
-        for rank2, (_teacher_key, tname, vote_count, student_count, percent) in enumerate(teacher_rows, start=1):
+        teacher_rows_data.sort(key=lambda x: (x[4], x[2]), reverse=True)
+        for rank2, (_teacher_key, tname, vote_count, student_count, percent) in enumerate(teacher_rows_data, start=1):
             ws_sub.append([rank2, tname, vote_count, student_count, percent])
 
     wb.save(SUBJECTS_RANKING_XLSX_FILE)
@@ -1302,15 +1308,12 @@ def export_subjects_ranking_to_excel() -> str:
 
 
 def create_backup_zip() -> str:
-    conn.commit()
     votes_path = export_votes_to_excel()
     users_path = export_users_to_excel()
     complaints_path = export_complaints_to_docx()
     subjects_ranking_path = export_subjects_ranking_to_excel()
 
     with zipfile.ZipFile(BACKUP_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
-        if os.path.exists(DB_NAME):
-            zf.write(DB_NAME, arcname="votes.db")
         for path in (votes_path, users_path, complaints_path, subjects_ranking_path):
             if path and os.path.exists(path):
                 zf.write(path, arcname=os.path.basename(path))
@@ -1329,8 +1332,10 @@ def get_results_text_by_scope(user_id: int, scope: str) -> str:
 # EXPORT
 # =========================
 def export_votes_to_csv() -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
+    rows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC",
+        fetch='all'
+    ) or []
     with open(EXPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["User ID", "Full Name", "Username", "Subject", "Teacher", "Voted At"])
@@ -1339,10 +1344,12 @@ def export_votes_to_csv() -> str:
             writer.writerow([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
     return EXPORT_FILE
 
+
 def ws_append_header(ws, headers):
     ws.append(headers)
     for cell in ws[1]:
         cell.style = "Headline 4"
+
 
 def export_votes_to_excel() -> str:
     if Workbook is None:
@@ -1352,25 +1359,33 @@ def export_votes_to_excel() -> str:
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
+    rows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC",
+        fetch='all'
+    ) or []
+    for user_id, full_name, username, subject_key, teacher_key, voted_at in rows:
         subject_key = normalize_subject_key(subject_key)
         ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
 
     for subject_key, subject_data in get_subjects_from_db().items():
         ws = wb.create_sheet(subject_data["name"][:31])
         ws_append_header(ws, ["User ID", "Full Name", "Username", "O'qituvchi", "Voted At"])
-        cursor.execute("SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = ? ORDER BY voted_at DESC", (subject_key,))
-        for user_id, full_name, username, teacher_key, voted_at in cursor.fetchall():
+        srows = execute_query_plain(
+            "SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = %s ORDER BY voted_at DESC",
+            (subject_key,), fetch='all'
+        ) or []
+        for user_id, full_name, username, teacher_key, voted_at in srows:
             ws.append([user_id, full_name or "", username or "", get_teacher_name(subject_key, teacher_key), voted_at or ""])
 
     ws = wb.create_sheet("Umumiy natija")
-    ws_append_header(ws, ["O'rin (Reyting)", "Kafedra", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Ishtirok foizi"] )
-    total = get_total_votes()
+    ws_append_header(ws, ["O'rin (Reyting)", "Kafedra", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Ishtirok foizi"])
     all_teachers_data = []
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-        count = cursor.fetchone()[0]
+        row = execute_query_plain(
+            "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+            (subject_key, teacher_key), fetch='one'
+        )
+        count = row[0] if row else 0
         scount = get_teacher_student_count(subject_key, teacher_key)
         percent = round(get_teacher_participation_percent(subject_key, teacher_key, count), 2)
         all_teachers_data.append((get_subject_name(subject_key), teacher_name, count, scount, percent))
@@ -1381,11 +1396,13 @@ def export_votes_to_excel() -> str:
     for subject_key, subject_data in get_subjects_from_db().items():
         ws = wb.create_sheet((subject_data["name"][:24] + " natija")[:31])
         ws_append_header(ws, ["O'rin (Reyting)", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Ishtirok foizi"])
-        subject_total = get_total_votes(subject_key)
         subject_teachers_data = []
         for teacher_key, teacher_name in subject_data["teachers"].items():
-            cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-            count = cursor.fetchone()[0]
+            row = execute_query_plain(
+                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
+                (subject_key, teacher_key), fetch='one'
+            )
+            count = row[0] if row else 0
             scount = get_teacher_student_count(subject_key, teacher_key)
             percent = round(get_teacher_participation_percent(subject_key, teacher_key, count), 2)
             subject_teachers_data.append((teacher_name, count, scount, percent))
@@ -1395,6 +1412,7 @@ def export_votes_to_excel() -> str:
 
     wb.save(VOTES_XLSX_FILE)
     return VOTES_XLSX_FILE
+
 
 def export_rating_to_excel() -> str:
     if Workbook is None:
@@ -1424,8 +1442,11 @@ def export_rating_to_excel() -> str:
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Rating", "Rated At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, rating, rated_at in cursor.fetchall():
+    rrows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC",
+        fetch='all'
+    ) or []
+    for user_id, full_name, username, subject_key, teacher_key, rating, rated_at in rrows:
         subject_key = normalize_subject_key(subject_key)
         ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), rating, rated_at or ""])
 
@@ -1433,19 +1454,19 @@ def export_rating_to_excel() -> str:
     return RATING_XLSX_FILE
 
 
-
 def export_users_to_excel() -> str:
-    """Barcha foydalanuvchilarni (user_prefs) Excel faylga eksport qiladi."""
     if Workbook is None:
         path = os.path.join(DATA_DIR, "users_export.csv")
-        cursor.execute("""
+        rows = execute_query_plain(
+            """
             SELECT up.user_id, up.script, up.access_granted,
                    v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
             FROM user_prefs up
             LEFT JOIN votes v ON up.user_id = v.user_id
             ORDER BY up.user_id
-        """)
-        rows = cursor.fetchall()
+            """,
+            fetch='all'
+        ) or []
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(["User ID", "Til", "Kirish", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"])
@@ -1464,20 +1485,21 @@ def export_users_to_excel() -> str:
     wb = Workbook()
     wb.remove(wb.active)
 
-    # --- 1-varaq: Barcha foydalanuvchilar ---
     ws_all = wb.create_sheet("Barcha foydalanuvchilar")
     ws_append_header(ws_all, [
         "User ID", "Til", "Kirish", "Ism", "Username",
         "Kafedra", "O'qituvchi", "Ovoz sanasi"
     ])
-    cursor.execute("""
+    all_rows = execute_query_plain(
+        """
         SELECT up.user_id, up.script, up.access_granted,
                v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
         FROM user_prefs up
         LEFT JOIN votes v ON up.user_id = v.user_id
         ORDER BY up.user_id
-    """)
-    all_rows = cursor.fetchall()
+        """,
+        fetch='all'
+    ) or []
     for uid, script, access, full_name, username, subject_key, teacher_key, voted_at in all_rows:
         subject_key = normalize_subject_key(subject_key) if subject_key else ""
         ws_all.append([
@@ -1491,16 +1513,15 @@ def export_users_to_excel() -> str:
             voted_at or ""
         ])
 
-    # --- 2-varaq: Faqat ovoz berganlar ---
     ws_voted = wb.create_sheet("Ovoz berganlar")
     ws_append_header(ws_voted, [
         "User ID", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"
     ])
-    cursor.execute("""
-        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
-        FROM votes ORDER BY voted_at DESC
-    """)
-    for uid, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
+    voted_rows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC",
+        fetch='all'
+    ) or []
+    for uid, full_name, username, subject_key, teacher_key, voted_at in voted_rows:
         subject_key = normalize_subject_key(subject_key)
         ws_voted.append([
             uid,
@@ -1511,17 +1532,19 @@ def export_users_to_excel() -> str:
             voted_at or ""
         ])
 
-    # --- 3-varaq: Hali ovoz bermaganlar ---
     ws_not_voted = wb.create_sheet("Ovoz bermaganlar")
     ws_append_header(ws_not_voted, ["User ID", "Til", "Kirish"])
-    cursor.execute("""
+    not_voted_rows = execute_query_plain(
+        """
         SELECT up.user_id, up.script, up.access_granted
         FROM user_prefs up
         LEFT JOIN votes v ON up.user_id = v.user_id
         WHERE v.user_id IS NULL
         ORDER BY up.user_id
-    """)
-    for uid, script, access in cursor.fetchall():
+        """,
+        fetch='all'
+    ) or []
+    for uid, script, access in not_voted_rows:
         ws_not_voted.append([uid, script or "latin", "Ha" if access else "Yo'q"])
 
     wb.save(USERS_XLSX_FILE)
@@ -1529,12 +1552,10 @@ def export_users_to_excel() -> str:
 
 
 def export_complaints_to_word() -> str:
-    cursor.execute("""
-        SELECT user_id, full_name, username, message_text, created_at
-        FROM complaints
-        ORDER BY created_at DESC
-    """)
-    rows = cursor.fetchall()
+    rows = execute_query_plain(
+        "SELECT user_id, full_name, username, message_text, created_at FROM complaints ORDER BY created_at DESC",
+        fetch='all'
+    ) or []
 
     if Document is None:
         txt_path = os.path.join(DATA_DIR, "shikoyat_takliflar.txt")
@@ -1544,7 +1565,6 @@ def export_complaints_to_word() -> str:
             if not rows:
                 f.write("Hali shikoyat yoki taklif yo'q.\n")
             for i, (user_id, full_name, username, message_text, created_at) in enumerate(rows, 1):
-                # FIX #3: f-string ichida apostrof xatosi tuzatildi
                 name = full_name or "Noma'lum"
                 uname = f"@{username}" if username else "yo'q"
                 f.write(f"{i}. Foydalanuvchi: {name}\n")
@@ -1594,6 +1614,7 @@ async def check_user_subscription(user_id: int) -> bool:
         logging.error(f"Obunani tekshirishda xatolik: {e}")
         return False
 
+
 async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     try:
         await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
@@ -1609,17 +1630,11 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
         logging.error(f"safe_edit_message umumiy xato: {e}")
 
 
-
 def add_refresh_time(text: str, user_id: int) -> str:
-    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
     return text + tr(user_id, f"  ⏱ Yangilandi: {uz_now().strftime('%H:%M:%S.%f')[:-3]}")
 
 
 def can_start_refresh(user_id: int, key: str) -> bool:
-    """
-    Bitta user bitta bo'limda refreshni ketma-ket bosib yuborsa,
-    parallel callbacklar natijani chalkashtirib yubormasligi uchun cheklaydi.
-    """
     now = uz_now().timestamp()
     refresh_key = (user_id, key)
 
@@ -1660,6 +1675,7 @@ def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription"))
     return kb.as_markup()
 
+
 def home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if has_access(user_id):
@@ -1677,6 +1693,7 @@ def home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     return kb.as_markup()
 
+
 def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     current = get_user_script(user_id)
@@ -1689,12 +1706,14 @@ def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in get_subjects_from_db().items():
         kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"subject:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1706,12 +1725,14 @@ def teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def rating_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in get_subjects_from_db().items():
         kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"rating_subject:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def rating_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1723,6 +1744,7 @@ def rating_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMa
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def rate_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -1733,6 +1755,7 @@ def rate_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKey
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=tr(user_id, "🥇 TOP 10 natijalar"), callback_data="user_top_votes"))
@@ -1740,6 +1763,7 @@ def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
         kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"show_results_user:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1749,12 +1773,14 @@ def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def rating_results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in get_subjects_from_db().items():
         kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_rating_stats:{subject_key}"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def results_keyboard_user(user_id: int, scope: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1764,6 +1790,7 @@ def results_keyboard_user(user_id: int, scope: str) -> InlineKeyboardMarkup:
     )
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def results_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1776,6 +1803,7 @@ def results_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def rating_stats_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -1784,6 +1812,7 @@ def rating_stats_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarku
     )
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def after_vote_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1837,6 +1866,7 @@ def teacher_stats_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMark
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="🥇 TOP 10 natijalar", callback_data="admin_top_votes_menu"))
@@ -1880,6 +1910,7 @@ def admin_settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if mode == "votes":
@@ -1897,6 +1928,7 @@ def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardM
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def complaint_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=tr(user_id, "👤 O'qituvchi ustidan shikoyat yuborish"), callback_data="complaint_teacher_start"))
@@ -1905,6 +1937,7 @@ def complaint_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def complaint_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in get_subjects_from_db().items():
@@ -1912,6 +1945,7 @@ def complaint_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_complaint_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def complaint_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1923,12 +1957,14 @@ def complaint_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboar
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
+
 def complaint_cancel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_complaint_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data="cancel_complaint"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def complaint_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1939,6 +1975,7 @@ def complaint_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_complaint_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
+
 
 def admin_complaints_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1956,6 +1993,7 @@ def complaints_keyboard_admin(user_id: int, complaint_type: str = "all") -> Inli
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -1970,16 +2008,18 @@ def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
 def get_complaints_text_filtered(user_id: int, complaint_type: str) -> str:
     complaint_type = "suggestion" if complaint_type == "suggestion" else "teacher_complaint"
     title = "💡 <b>Takliflar</b>" if complaint_type == "suggestion" else "👤 <b>O'qituvchi ustidan shikoyatlar</b>"
-    cursor.execute("""
+    rows = execute_query_plain(
+        """
         SELECT id, user_id, full_name, username, type, subject_key, teacher_key, message_text, created_at
         FROM complaints
-        WHERE type = ?
+        WHERE type = %s
         ORDER BY id DESC
         LIMIT 30
-    """, (complaint_type,))
-    rows = cursor.fetchall()
-    cursor.execute("SELECT COUNT(*) FROM complaints WHERE type = ?", (complaint_type,))
-    total = cursor.fetchone()[0]
+        """,
+        (complaint_type,), fetch='all'
+    ) or []
+    total_row = execute_query_plain("SELECT COUNT(*) FROM complaints WHERE type = %s", (complaint_type,), fetch='one')
+    total = total_row[0] if total_row else 0
     if not rows:
         return tr(user_id, f"{title}\n\nHali ma'lumot yo'q.")
 
@@ -2003,13 +2043,15 @@ def export_complaints_filtered_to_excel(complaint_type: str) -> str:
     complaint_type = "suggestion" if complaint_type == "suggestion" else "teacher_complaint"
     filename = "suggestions_export.xlsx" if complaint_type == "suggestion" else "teacher_complaints_export.xlsx"
     path = os.path.join(DATA_DIR, filename)
-    cursor.execute("""
+    rows = execute_query_plain(
+        """
         SELECT id, user_id, full_name, username, type, subject_key, teacher_key, message_text, created_at
         FROM complaints
-        WHERE type = ?
+        WHERE type = %s
         ORDER BY id DESC
-    """, (complaint_type,))
-    rows = cursor.fetchall()
+        """,
+        (complaint_type,), fetch='all'
+    ) or []
 
     if Workbook is None:
         path = path.replace(".xlsx", ".csv")
@@ -2055,11 +2097,10 @@ async def my_access_handler(message: Message):
     ensure_user(user_id)
     if not is_admin(user_id):
         return
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    # FIX #3: apostrof xatosi tuzatildi
+    row = execute_query_plain("SELECT access_granted FROM user_prefs WHERE user_id = %s", (user_id,), fetch='one')
     val = row[0] if row else "yo'q"
     await message.answer(f"access_granted: {val}")
+
 
 @dp.message(Command("check_channel"))
 async def check_channel_handler(message: Message):
@@ -2077,11 +2118,13 @@ async def check_channel_handler(message: Message):
     except Exception as e:
         await message.answer(f"❌ Kanalni tekshirib bo'lmadi.\nBotni kanalga admin qiling.\nXato: {e}")
 
+
 @dp.message(Command("results"))
 async def results_handler(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
     await message.answer(get_results_menu_text(user_id, False), parse_mode="HTML", reply_markup=results_menu_keyboard_user(user_id))
+
 
 @dp.message(Command("debug_eshnazarova"))
 async def debug_eshnazarova_handler(message: Message):
@@ -2089,13 +2132,10 @@ async def debug_eshnazarova_handler(message: Message):
     if not is_admin(user_id):
         return
 
-    cursor.execute("""
-        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE teacher_key = 'aif_10'
-        ORDER BY voted_at DESC
-    """)
-    rows = cursor.fetchall()
+    rows = execute_query_plain(
+        "SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes WHERE teacher_key = 'aif_10' ORDER BY voted_at DESC",
+        fetch='all'
+    ) or []
     if not rows:
         await message.answer("Eshnazarova Maziya Allanazarovna uchun bazada ovoz yo'q.")
         return
@@ -2104,6 +2144,7 @@ async def debug_eshnazarova_handler(message: Message):
     for uid, full_name, username, subject_key, teacher_key, voted_at in rows:
         lines.append(f"ID: {uid} | {full_name or ''} | @{username or ''} | {subject_key}/{teacher_key} | {voted_at}")
     await message.answer("\n".join(lines[:50]))
+
 
 @dp.message(Command("admin"))
 async def admin_panel_handler(message: Message):
@@ -2114,6 +2155,7 @@ async def admin_panel_handler(message: Message):
         return
     await message.answer(get_admin_panel_text(user_id), parse_mode="HTML", reply_markup=admin_panel_keyboard(user_id))
 
+
 @dp.message(Command("users"))
 async def admin_users_handler(message: Message):
     user_id = message.from_user.id
@@ -2121,6 +2163,7 @@ async def admin_users_handler(message: Message):
         await message.answer("Siz admin emassiz.")
         return
     await message.answer(get_users_text(user_id), parse_mode="HTML", reply_markup=users_keyboard_admin(user_id))
+
 
 @dp.message(Command("export"))
 async def admin_export_handler(message: Message):
@@ -2131,6 +2174,7 @@ async def admin_export_handler(message: Message):
     filename = export_votes_to_excel()
     await message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
 
+
 @dp.message(Command("open"))
 async def admin_open_handler(message: Message):
     user_id = message.from_user.id
@@ -2140,6 +2184,7 @@ async def admin_open_handler(message: Message):
     open_voting()
     await message.answer("🟢 Ovoz berish ochildi.")
 
+
 @dp.message(Command("close"))
 async def admin_close_handler(message: Message):
     user_id = message.from_user.id
@@ -2148,6 +2193,7 @@ async def admin_close_handler(message: Message):
         return
     close_voting()
     await message.answer("🔴 Ovoz berish yopildi.")
+
 
 @dp.message(Command("reset_votes"))
 async def admin_reset_handler(message: Message):
@@ -2184,6 +2230,7 @@ async def help_info_handler(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
     await safe_edit_message(callback, get_help_text(user_id), kb.as_markup())
     await callback.answer()
+
 
 @dp.callback_query(F.data == "my_vote")
 async def my_vote_handler(callback: CallbackQuery):
@@ -2242,6 +2289,7 @@ async def complaint_teacher_start_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_complaint_teacher_subject_text(user_id), complaint_subjects_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("complaint_subject:"))
 async def complaint_subject_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2252,6 +2300,7 @@ async def complaint_subject_handler(callback: CallbackQuery):
     COMPLAINT_STATE[user_id] = {"mode": "teacher_complaint", "subject_key": subject_key}
     await safe_edit_message(callback, get_complaint_teacher_select_text(user_id, subject_key), complaint_teachers_keyboard(user_id, subject_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("complaint_teacher:"))
 async def complaint_teacher_handler(callback: CallbackQuery):
@@ -2270,6 +2319,7 @@ async def complaint_teacher_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_complaint_write_text(user_id, "teacher_complaint", subject_key, teacher_key), complaint_cancel_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "suggestion_start")
 async def suggestion_start_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2281,6 +2331,7 @@ async def suggestion_start_handler(callback: CallbackQuery):
     WAITING_COMPLAINT_TEXT.add(user_id)
     await safe_edit_message(callback, get_complaint_write_text(user_id, "suggestion"), complaint_cancel_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "confirm_complaint_send")
 async def confirm_complaint_send_handler(callback: CallbackQuery):
@@ -2332,6 +2383,7 @@ async def set_script_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_settings_text(user_id), settings_keyboard(user_id))
     await callback.answer(tr(user_id, "Yozuv turi saqlandi"))
 
+
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2345,8 +2397,6 @@ async def check_subscription_handler(callback: CallbackQuery):
         return
 
     grant_access(user_id)
-
-    # FIX #5: grant_access dan keyin keraksiz tekshiruv olib tashlandi
     await safe_edit_message(
         callback,
         "✅ <b>Obuna tasdiqlandi</b>\n\nEndi bosh menyudan bemalol foydalanishingiz mumkin:",
@@ -2359,7 +2409,6 @@ async def check_subscription_handler(callback: CallbackQuery):
 async def go_vote_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    # Ovoz berishdan oldin obuna holati qayta tekshiriladi.
     if not await check_user_subscription(user_id):
         reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
@@ -2377,6 +2426,7 @@ async def go_vote_panel_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_subject_select_text(user_id), subjects_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("subject:"))
 async def subject_select_handler(callback: CallbackQuery):
@@ -2399,6 +2449,7 @@ async def subject_select_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_teacher_select_text(user_id, subject_key), teachers_keyboard(user_id, subject_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("vote:"))
 async def vote_handler(callback: CallbackQuery):
@@ -2511,6 +2562,7 @@ async def show_results_menu_user(callback: CallbackQuery):
     await safe_edit_message(callback, get_results_menu_text(user_id, False), results_menu_keyboard_user(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "show_results_user:general")
 async def show_results_user_general(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2518,6 +2570,7 @@ async def show_results_user_general(callback: CallbackQuery):
         text = add_refresh_time(get_general_results_text(user_id), user_id)
     await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("show_results_user:"))
 async def show_results_user(callback: CallbackQuery):
@@ -2553,6 +2606,7 @@ async def refresh_results_user_general(callback: CallbackQuery):
     finally:
         finish_refresh(user_id, refresh_key)
 
+
 @dp.callback_query(F.data.startswith("refresh_results_user:"))
 async def refresh_results_user(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2579,7 +2633,6 @@ async def refresh_results_user(callback: CallbackQuery):
         finish_refresh(user_id, refresh_key)
 
 
-
 @dp.callback_query(F.data == "user_top_votes")
 async def user_top_votes_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2604,6 +2657,7 @@ async def back_admin_panel_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_cleanup_menu")
 async def admin_cleanup_menu_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2613,6 +2667,7 @@ async def admin_cleanup_menu_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "🧹 <b>Tozalash</b>\n\nQaysi ma'lumotlarni tozalamoqchisiz?", admin_cleanup_menu_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_download_menu")
 async def admin_download_menu_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2621,6 +2676,7 @@ async def admin_download_menu_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "📥 <b>Ma'lumotlarni yuklab olish</b>\n\nKerakli fayl turini tanlang:", admin_download_menu_keyboard(user_id))
     await callback.answer()
+
 
 def get_admin_settings_text(user_id: int) -> str:
     status_icon = "🟢" if is_voting_open() else "🔴"
@@ -2641,6 +2697,7 @@ async def admin_settings_menu_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_settings_text(user_id), admin_settings_menu_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_open")
 async def admin_open_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2651,6 +2708,7 @@ async def admin_open_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_settings_text(user_id), admin_settings_menu_keyboard(user_id))
     await callback.answer("Ovoz berish ochildi")
 
+
 @dp.callback_query(F.data == "admin_close")
 async def admin_close_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2660,6 +2718,7 @@ async def admin_close_callback(callback: CallbackQuery):
     close_voting()
     await safe_edit_message(callback, get_admin_settings_text(user_id), admin_settings_menu_keyboard(user_id))
     await callback.answer("Ovoz berish yopildi")
+
 
 @dp.callback_query(F.data == "admin_results")
 async def admin_results_callback(callback: CallbackQuery):
@@ -2682,6 +2741,7 @@ async def show_results_admin_general(callback: CallbackQuery):
         text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "refresh_results_admin:general")
 async def refresh_results_admin_general(callback: CallbackQuery):
@@ -2787,6 +2847,7 @@ async def admin_top_votes_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_teacher_stats")
 async def admin_teacher_stats_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2843,7 +2904,7 @@ async def admin_backup_handler(callback: CallbackQuery):
             backup_path = create_backup_zip()
         await callback.message.answer_document(
             FSInputFile(backup_path),
-            caption="💾 Backup: votes.db, ovozlar Excel va shikoyatlar fayli."
+            caption="💾 Backup: ovozlar Excel va shikoyatlar fayli."
         )
     except Exception as e:
         logging.error(f"Backup yaratishda xatolik: {e}")
@@ -2910,7 +2971,6 @@ async def admin_export_complaints_docx_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-
 @dp.callback_query(F.data == "admin_export_teacher_complaints_excel")
 async def admin_export_teacher_complaints_excel_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2955,6 +3015,7 @@ async def admin_users_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "refresh_admin_users")
 async def refresh_admin_users(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2987,9 +3048,22 @@ async def admin_export_votes_excel_callback(callback: CallbackQuery):
     await callback.message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
     await callback.answer()
 
+
+@dp.callback_query(F.data == "admin_export_users_excel")
+async def admin_export_users_excel_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    filename = export_users_to_excel()
+    await callback.message.answer_document(FSInputFile(filename), caption="👥 Foydalanuvchilar Excel fayli.")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "admin_export_rating_excel")
 async def admin_export_rating_excel_callback(callback: CallbackQuery):
     await callback.answer("Baholash funksiyasi olib tashlangan.", show_alert=True)
+
 
 @dp.callback_query(F.data == "admin_reset_rating_confirm")
 async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
@@ -2999,6 +3073,21 @@ async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha rating baholari o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "rating"))
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_reset_votes_confirm")
+async def admin_reset_votes_confirm_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(
+        callback,
+        "⚠️ <b>Diqqat!</b>\n\nBarcha ovozlar o'chiriladi.\nDavom etasizmi?",
+        reset_confirm_keyboard(user_id, "votes")
+    )
+    await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_reset_complaints_confirm")
 async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
@@ -3013,6 +3102,7 @@ async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_reset_complaints")
 async def admin_reset_complaints_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3024,6 +3114,7 @@ async def admin_reset_complaints_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Shikoyat va takliflar tozalandi!")
 
+
 @dp.callback_query(F.data == "cancel_reset")
 async def cancel_reset_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3032,6 +3123,7 @@ async def cancel_reset_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer(tr(user_id, "Bekor qilindi"))
+
 
 @dp.callback_query(F.data == "admin_reset_votes")
 async def admin_reset_votes_callback(callback: CallbackQuery):
@@ -3043,6 +3135,7 @@ async def admin_reset_votes_callback(callback: CallbackQuery):
         reset_votes()
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Ovozlar reset qilindi!")
+
 
 @dp.callback_query(F.data == "admin_reset_rating")
 async def admin_reset_rating_callback(callback: CallbackQuery):
@@ -3056,85 +3149,86 @@ async def admin_reset_rating_callback(callback: CallbackQuery):
     await callback.answer("Rating reset qilindi!")
 
 
-# FIX #6: Keraksiz takroriy callbacklar olib tashlandi.
-# admin_complaints_word, admin_export_complaints_word, admin_export, admin_reset_confirm,
-# admin_reset — bular yo'q yoki birining nomi bilan almashtirilib qolgan edi.
-# Eski nomlar hali ham ishlashi kerak bo'lsa, quyida saqlanadi:
-
 @dp.callback_query(F.data == "admin_export")
 async def admin_export_callback(callback: CallbackQuery):
     await admin_export_votes_excel_callback(callback)
 
+
 @dp.callback_query(F.data == "admin_reset_confirm")
 async def admin_reset_confirm_old_callback(callback: CallbackQuery):
     await admin_reset_votes_confirm_callback(callback)
+
 
 @dp.callback_query(F.data == "admin_reset")
 async def admin_reset_old_callback(callback: CallbackQuery):
     await admin_reset_votes_callback(callback)
 
 # =========================
-
-# =========================
 # ADMIN DB MANAGE FUNCTIONS
 # =========================
 def db_add_subject(subject_key: str, subject_name: str) -> bool:
     try:
-        cursor.execute("SELECT MAX(sort_order) FROM db_subjects")
-        row = cursor.fetchone()
+        row = execute_query_plain("SELECT MAX(sort_order) FROM db_subjects", fetch='one')
         max_order = (row[0] or 0) + 1
-        cursor.execute("INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (?, ?, ?)",
-                       (subject_key, subject_name, max_order))
-        conn.commit()
+        execute_query(
+            "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (%s, %s, %s)",
+            (subject_key, subject_name, max_order)
+        )
         return True
-    except DBIntegrityError:
+    except PgIntegrityError:
         return False
 
+
 def db_edit_subject(subject_key: str, new_name: str) -> bool:
-    cursor.execute("UPDATE db_subjects SET subject_name = ? WHERE subject_key = ?", (new_name, subject_key))
-    conn.commit()
-    return cursor.rowcount > 0
+    rowcount = execute_query("UPDATE db_subjects SET subject_name = %s WHERE subject_key = %s", (new_name, subject_key))
+    return rowcount > 0
+
 
 def db_delete_subject(subject_key: str) -> bool:
-    cursor.execute("DELETE FROM db_teachers WHERE subject_key = ?", (subject_key,))
-    cursor.execute("DELETE FROM db_subjects WHERE subject_key = ?", (subject_key,))
-    conn.commit()
+    execute_query("DELETE FROM db_teachers WHERE subject_key = %s", (subject_key,))
+    execute_query("DELETE FROM db_subjects WHERE subject_key = %s", (subject_key,))
     return True
+
 
 def db_add_teacher(subject_key: str, teacher_key: str, teacher_name: str) -> bool:
     try:
-        cursor.execute("INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (?, ?, ?)",
-                       (teacher_key, subject_key, teacher_name))
-        conn.commit()
+        execute_query(
+            "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (%s, %s, %s)",
+            (teacher_key, subject_key, teacher_name)
+        )
         return True
-    except DBIntegrityError:
+    except PgIntegrityError:
         return False
 
+
 def db_edit_teacher(subject_key: str, teacher_key: str, new_name: str) -> bool:
-    cursor.execute("UPDATE db_teachers SET teacher_name = ? WHERE subject_key = ? AND teacher_key = ?",
-                   (new_name, subject_key, teacher_key))
-    conn.commit()
-    return cursor.rowcount > 0
+    rowcount = execute_query(
+        "UPDATE db_teachers SET teacher_name = %s WHERE subject_key = %s AND teacher_key = %s",
+        (new_name, subject_key, teacher_key)
+    )
+    return rowcount > 0
+
 
 def db_delete_teacher(subject_key: str, teacher_key: str) -> bool:
-    cursor.execute("DELETE FROM db_teachers WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    conn.commit()
-    return cursor.rowcount > 0
+    rowcount = execute_query("DELETE FROM db_teachers WHERE subject_key = %s AND teacher_key = %s", (subject_key, teacher_key))
+    return rowcount > 0
+
 
 def generate_teacher_key(subject_key: str) -> str:
     prefix = subject_key[:3]
-    cursor.execute("SELECT teacher_key FROM db_teachers WHERE subject_key = ?", (subject_key,))
-    existing = {r[0] for r in cursor.fetchall()}
+    rows = execute_query_plain("SELECT teacher_key FROM db_teachers WHERE subject_key = %s", (subject_key,), fetch='all') or []
+    existing = {r[0] for r in rows}
     i = 1
     while f"{prefix}_{i}" in existing:
         i += 1
     return f"{prefix}_{i}"
 
+
 def generate_subject_key(name: str) -> str:
     import re as _re
     base = _re.sub(r"[^a-zA-Z0-9]", "", name.lower().replace(" ", "_"))[:8] or "subj"
-    cursor.execute("SELECT subject_key FROM db_subjects")
-    existing = {r[0] for r in cursor.fetchall()}
+    rows = execute_query_plain("SELECT subject_key FROM db_subjects", fetch='all') or []
+    existing = {r[0] for r in rows}
     key = base
     i = 1
     while key in existing:
@@ -3155,6 +3249,7 @@ def admin_manage_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def manage_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     subjects = get_subjects_from_db()
@@ -3165,6 +3260,7 @@ def manage_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def manage_subject_actions_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -3178,6 +3274,7 @@ def manage_subject_actions_keyboard(user_id: int, subject_key: str) -> InlineKey
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def manage_teachers_select_subject_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     subjects = get_subjects_from_db()
@@ -3187,6 +3284,7 @@ def manage_teachers_select_subject_keyboard(user_id: int) -> InlineKeyboardMarku
     kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def manage_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -3200,6 +3298,7 @@ def manage_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMa
     kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def manage_teacher_actions_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -3215,12 +3314,14 @@ def manage_teacher_actions_keyboard(user_id: int, subject_key: str, teacher_key:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
+
 def manage_cancel_keyboard(user_id: int, back_cb: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga / Bekor qilish", callback_data=back_cb))
     kb.row(InlineKeyboardButton(text="⬅️ Sozlamalar", callback_data="admin_settings_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
+
 
 def top_votes_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -3230,7 +3331,6 @@ def top_votes_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
-
 
 # =========================
 # ADMIN TOP VOTES MENU CALLBACKS
@@ -3243,6 +3343,7 @@ async def admin_top_votes_menu_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "🥇 <b>TOP 10 ovoz bo'yicha</b>\n\nQaysi ko'rinishda ko'rmoqchisiz?", top_votes_menu_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_top_votes_by_subject")
 async def admin_top_votes_by_subject_callback(callback: CallbackQuery):
@@ -3259,7 +3360,6 @@ async def admin_top_votes_by_subject_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
-
 # =========================
 # ADMIN MANAGE CALLBACKS
 # =========================
@@ -3272,6 +3372,7 @@ async def admin_manage_menu_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "⚙️ <b>Boshqarish menyusi</b>\n\nNimani boshqarmoqchisiz?", admin_manage_menu_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "manage_subjects")
 async def manage_subjects_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3282,6 +3383,7 @@ async def manage_subjects_callback(callback: CallbackQuery):
     text = f"🏫 <b>Bo'limlar ro'yxati</b>\n\nJami: {len(subjects)} ta bo'lim"
     await safe_edit_message(callback, text, manage_subjects_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_subject_actions:"))
 async def manage_subject_actions_callback(callback: CallbackQuery):
@@ -3297,6 +3399,7 @@ async def manage_subject_actions_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, manage_subject_actions_keyboard(user_id, subject_key))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "manage_subject_add")
 async def manage_subject_add_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3308,6 +3411,7 @@ async def manage_subject_add_callback(callback: CallbackQuery):
         "➕ <b>Yangi bo'lim qo'shish</b>\n\nBo'lim nomini yozing (masalan: Tarix fanlari):",
         manage_cancel_keyboard(user_id, "manage_subjects"))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_subject_edit:"))
 async def manage_subject_edit_callback(callback: CallbackQuery):
@@ -3322,6 +3426,7 @@ async def manage_subject_edit_callback(callback: CallbackQuery):
         f"✏️ <b>Bo'lim nomini o'zgartirish</b>\n\nHozirgi nom: <b>{sname}</b>\n\nYangi nomni yozing:",
         manage_cancel_keyboard(user_id, f"manage_subject_actions:{subject_key}"))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_subject_delete_confirm:"))
 async def manage_subject_delete_confirm_callback(callback: CallbackQuery):
@@ -3345,6 +3450,7 @@ async def manage_subject_delete_confirm_callback(callback: CallbackQuery):
         kb.as_markup())
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("manage_subject_delete:"))
 async def manage_subject_delete_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3360,6 +3466,7 @@ async def manage_subject_delete_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, manage_subjects_keyboard(user_id))
     await callback.answer("O'chirildi!")
 
+
 @dp.callback_query(F.data == "manage_teachers_select_subject")
 async def manage_teachers_select_subject_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3368,6 +3475,7 @@ async def manage_teachers_select_subject_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "👨‍🏫 <b>O'qituvchilarni boshqarish</b>\n\nBo'limni tanlang:", manage_teachers_select_subject_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_teachers:"))
 async def manage_teachers_callback(callback: CallbackQuery):
@@ -3382,6 +3490,7 @@ async def manage_teachers_callback(callback: CallbackQuery):
     text = f"👨‍🏫 <b>{sname}</b>\n\nO'qituvchilar soni: {teacher_count}\n\nO'qituvchini tanlang:"
     await safe_edit_message(callback, text, manage_teachers_keyboard(user_id, subject_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_teacher_actions:"))
 async def manage_teacher_actions_callback(callback: CallbackQuery):
@@ -3400,6 +3509,7 @@ async def manage_teacher_actions_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, manage_teacher_actions_keyboard(user_id, subject_key, teacher_key))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("manage_teacher_add:"))
 async def manage_teacher_add_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3413,6 +3523,7 @@ async def manage_teacher_add_callback(callback: CallbackQuery):
         f"➕ <b>Yangi o'qituvchi qo'shish</b>\n📂 Bo'lim: <b>{sname}</b>\n\nO'qituvchi to'liq ismini yozing (F.I.Sh):",
         manage_cancel_keyboard(user_id, f"manage_teachers:{subject_key}"))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_teacher_edit:"))
 async def manage_teacher_edit_callback(callback: CallbackQuery):
@@ -3431,6 +3542,7 @@ async def manage_teacher_edit_callback(callback: CallbackQuery):
         f"✏️ <b>O'qituvchi nomini o'zgartirish</b>\n\nHozirgi ism: <b>{tname}</b>\n\nYangi to'liq ismni yozing:",
         manage_cancel_keyboard(user_id, f"manage_teacher_actions:{subject_key}:{teacher_key}"))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_teacher_students:"))
 async def manage_teacher_students_callback(callback: CallbackQuery):
@@ -3452,6 +3564,7 @@ async def manage_teacher_students_callback(callback: CallbackQuery):
         manage_cancel_keyboard(user_id, f"manage_teacher_actions:{subject_key}:{teacher_key}")
     )
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("manage_teacher_delete_confirm:"))
 async def manage_teacher_delete_confirm_callback(callback: CallbackQuery):
@@ -3477,6 +3590,7 @@ async def manage_teacher_delete_confirm_callback(callback: CallbackQuery):
         kb.as_markup())
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("manage_teacher_delete:"))
 async def manage_teacher_delete_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -3496,7 +3610,7 @@ async def manage_teacher_delete_callback(callback: CallbackQuery):
         manage_teachers_keyboard(user_id, subject_key))
     await callback.answer("O'chirildi!")
 
-
+# =========================
 # TEXT HANDLER
 # =========================
 @dp.message(F.text)
@@ -3504,7 +3618,6 @@ async def text_handler(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
 
-    # Admin boshqarish holati
     if is_admin(user_id) and user_id in ADMIN_MANAGE_STATE:
         state = ADMIN_MANAGE_STATE.pop(user_id)
         text = (message.text or "").strip()
@@ -3612,15 +3725,13 @@ async def text_handler(message: Message):
             reply_markup=results_menu_keyboard_user(user_id)
         )
 
-
 # =========================
 # MAIN
 # =========================
 async def main():
     init_db()
-    logging.info(f"Bot ishga tushdi. Baza: {DB_NAME}")
+    logging.info("Bot ishga tushdi. PostgreSQL baza ulandi.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
