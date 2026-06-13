@@ -3,8 +3,12 @@ import csv
 import re
 import asyncio
 import logging
-import sqlite3
 import zipfile
+try:
+    import psycopg2
+    import psycopg2.errors
+except ImportError:
+    psycopg2 = None
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
@@ -160,8 +164,65 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-cursor = conn.cursor()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL muhit o'zgaruvchisi topilmadi. Railway PostgreSQL ulanishini tekshiring.")
+
+if psycopg2 is None:
+    raise RuntimeError("psycopg2-binary o'rnatilmagan. requirements.txt ga psycopg2-binary qo'shing.")
+
+
+class SmartCursor:
+    """
+    SQLite uslubidagi eski SQL so'rovlarni PostgreSQL uchun moslab bajaradi.
+    Bu bot logikasini o'zgartirmasdan Railway PostgreSQL bilan ishlashini ta'minlaydi.
+    """
+    def __init__(self, connection):
+        self.connection = connection
+        self._cursor = connection.cursor()
+        self.rowcount = -1
+
+    def _translate_sql(self, sql: str) -> str:
+        q = sql
+        q = q.replace("?", "%s")
+        q = q.replace("id INTEGER PRIMARY KEY AUTOINCREMENT", "id SERIAL PRIMARY KEY")
+        q = q.replace("user_id INTEGER", "user_id BIGINT")
+        q = q.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO db_subjects" in q and "ON CONFLICT" not in q:
+            q += " ON CONFLICT (subject_key) DO NOTHING"
+        if "INSERT INTO db_teachers" in q and "ON CONFLICT" not in q:
+            q += " ON CONFLICT (subject_key, teacher_key) DO NOTHING"
+        return q
+
+    def execute(self, sql: str, params=()):
+        q = self._translate_sql(sql)
+        try:
+            self._cursor.execute(q, params)
+        except psycopg2.errors.DuplicateColumn:
+            # ALTER TABLE ADD COLUMN qayta ishlaganda ustun bor bo'lsa, davom etamiz.
+            self.connection.rollback()
+            self._cursor = self.connection.cursor()
+            self.rowcount = 0
+            return self
+        self.rowcount = self._cursor.rowcount
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+def make_db_connection():
+    pg_conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
+    pg_conn.autocommit = True
+    return pg_conn, SmartCursor(pg_conn)
+
+
+conn, cursor = make_db_connection()
+DBIntegrityError = (psycopg2.IntegrityError,)
+DBOperationalError = (psycopg2.Error,)
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
 COMPLAINT_STATE = {}  # {user_id: {mode, subject_key, teacher_key, text}}
@@ -334,7 +395,7 @@ def init_db():
     ]:
         try:
             cursor.execute(f"ALTER TABLE complaints ADD COLUMN {col} {definition}")
-        except sqlite3.OperationalError:
+        except DBOperationalError:
             pass
 
     cursor.execute("""
@@ -356,7 +417,7 @@ def init_db():
     """)
     try:
         cursor.execute("ALTER TABLE db_teachers ADD COLUMN student_count INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
+    except DBOperationalError:
         pass
     conn.commit()
     migrate_old_subject_keys()
@@ -477,7 +538,7 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
         ))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         return False
 
 # FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
@@ -3026,7 +3087,7 @@ def db_add_subject(subject_key: str, subject_name: str) -> bool:
                        (subject_key, subject_name, max_order))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         return False
 
 def db_edit_subject(subject_key: str, new_name: str) -> bool:
@@ -3046,7 +3107,7 @@ def db_add_teacher(subject_key: str, teacher_key: str, teacher_name: str) -> boo
                        (teacher_key, subject_key, teacher_name))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         return False
 
 def db_edit_teacher(subject_key: str, teacher_key: str, new_name: str) -> bool:
