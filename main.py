@@ -1193,12 +1193,13 @@ def get_my_vote_text(user_id: int) -> str:
 
     subject_key, teacher_key, voted_at = row[0], row[1], row[2]
     subject_key = normalize_subject_key(subject_key)
+    sana = voted_at if voted_at else "Noma'lum"
     return tr(
         user_id,
         f"🧾 <b>Mening ovozim</b>\n\n"
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
         f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
-        f"<b>Sana:</b> {voted_at or 'Noma\\'lum'}"
+        f"<b>Sana:</b> {sana}"
     )
 
 
