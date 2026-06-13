@@ -390,6 +390,22 @@ def init_db():
                     )
                 """)
         conn.commit()
+
+        # Mavjud jadvallar uchun user_id ustunini BIGINT ga o'tkazish
+        # (eski deployda INTEGER bo'lib qolgan bo'lishi mumkin)
+        with conn:
+            with conn.cursor() as cur:
+                for alter_sql in [
+                    "ALTER TABLE votes ALTER COLUMN user_id TYPE BIGINT",
+                    "ALTER TABLE user_prefs ALTER COLUMN user_id TYPE BIGINT",
+                    "ALTER TABLE teacher_ratings ALTER COLUMN user_id TYPE BIGINT",
+                    "ALTER TABLE complaints ALTER COLUMN user_id TYPE BIGINT",
+                ]:
+                    try:
+                        cur.execute(alter_sql)
+                    except Exception:
+                        pass
+        conn.commit()
     finally:
         conn.close()
 
