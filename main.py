@@ -4,17 +4,18 @@ import re
 import asyncio
 import logging
 import zipfile
+import time
 from datetime import datetime, timezone, timedelta
 from html import escape
-from typing import Optional
+from typing import Optional, Any, Awaitable, Callable, Dict
 
-import psycopg2
-import psycopg2.extras
-from psycopg2 import IntegrityError as PgIntegrityError
+from asyncpg.exceptions import UniqueViolationError as PgIntegrityError
+from cachetools import TTLCache
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
@@ -24,6 +25,17 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from db import (
+    close_pool,
+    execute_sync,
+    fetch_sync,
+    fetchrow_sync,
+    init_pool,
+    parse_rowcount,
+    reset_request_sql_time,
+    get_request_sql_time,
+)
 
 try:
     from openpyxl import Workbook
@@ -165,6 +177,45 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# =========================
+# CACHE / PERFORMANCE
+# =========================
+SETTINGS_CACHE: TTLCache = TTLCache(maxsize=256, ttl=60)
+USER_PREFS_CACHE: TTLCache = TTLCache(maxsize=20000, ttl=300)
+SUBJECTS_CACHE: TTLCache = TTLCache(maxsize=4, ttl=60)
+STATS_CACHE: TTLCache = TTLCache(maxsize=512, ttl=60)
+
+def invalidate_stats_cache() -> None:
+    STATS_CACHE.clear()
+
+def invalidate_subjects_cache() -> None:
+    SUBJECTS_CACHE.clear()
+    invalidate_stats_cache()
+
+class PerformanceMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: Dict[str, Any],
+    ) -> Any:
+        reset_request_sql_time()
+        started = time.perf_counter()
+        try:
+            return await handler(event, data)
+        finally:
+            total_time = time.perf_counter() - started
+            sql_time = get_request_sql_time()
+            if isinstance(event, CallbackQuery):
+                logging.info(
+                    "BUTTON=%s SQL_TIME=%.4fs TOTAL_TIME=%.4fs",
+                    event.data or "unknown",
+                    sql_time,
+                    total_time,
+                )
+
+dp.callback_query.middleware(PerformanceMiddleware())
+
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
 COMPLAINT_STATE = {}
@@ -186,48 +237,43 @@ def uz_now() -> datetime:
     return datetime.now(UZ_TZ)
 
 # =========================
-# POSTGRESQL ULANISH
+# POSTGRESQL ASYNCPG POOL WRAPPERS
 # =========================
-def get_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+def _params(params):
+    if params is None:
+        return ()
+    if isinstance(params, (list, tuple)):
+        return tuple(params)
+    return (params,)
 
 def execute_query(sql: str, params=None, fetch: str = None):
+    """Legacy-compatible helper backed by asyncpg global pool.
+
+    fetch=None  -> execute and return affected row count
+    fetch='one' -> return dict row
+    fetch='all' -> return list[dict]
     """
-    fetch = None  -> faqat execute (INSERT/UPDATE/DELETE)
-    fetch = 'one' -> fetchone()
-    fetch = 'all' -> fetchall()
-    """
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                if fetch == 'one':
-                    row = cur.fetchone()
-                    return dict(row) if row else None
-                elif fetch == 'all':
-                    rows = cur.fetchall()
-                    return [dict(r) for r in rows]
-                else:
-                    return cur.rowcount
-    finally:
-        conn.close()
+    args = _params(params)
+    if fetch == 'one':
+        row = fetchrow_sync(sql, *args)
+        return dict(row) if row else None
+    if fetch == 'all':
+        rows = fetch_sync(sql, *args)
+        return [dict(r) for r in rows]
+    status = execute_sync(sql, *args)
+    return parse_rowcount(status)
 
 def execute_query_plain(sql: str, params=None, fetch: str = None):
-    """RealDictCursor emas, oddiy tuple cursor ishlatadi."""
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                if fetch == 'one':
-                    return cur.fetchone()
-                elif fetch == 'all':
-                    return cur.fetchall()
-                else:
-                    return cur.rowcount
-    finally:
-        conn.close()
+    """Tuple-style legacy helper backed by asyncpg global pool."""
+    args = _params(params)
+    if fetch == 'one':
+        row = fetchrow_sync(sql, *args)
+        return tuple(row) if row else None
+    if fetch == 'all':
+        rows = fetch_sync(sql, *args)
+        return [tuple(r) for r in rows]
+    status = execute_sync(sql, *args)
+    return parse_rowcount(status)
 
 # =========================
 # LOTIN / KRILL
@@ -290,16 +336,24 @@ def translit_html_safe(text: str, script: str) -> str:
 
 
 def get_user_script(user_id: int) -> str:
-    ensure_user(user_id)
-    row = execute_query_plain("SELECT script FROM user_prefs WHERE user_id = %s", (user_id,), fetch='one')
-    return row[0] if row and row[0] in ("latin", "cyrillic") else "latin"
+    cached = USER_PREFS_CACHE.get(user_id)
+    if cached:
+        script = cached.get("script", "latin")
+        return script if script in ("latin", "cyrillic") else "latin"
+    row = execute_query_plain("SELECT script, access_granted FROM user_prefs WHERE user_id = $1", (user_id,), fetch='one')
+    if row:
+        USER_PREFS_CACHE[user_id] = {"script": row[0] or "latin", "access_granted": int(row[1] or 0)}
+        return row[0] if row[0] in ("latin", "cyrillic") else "latin"
+    return "latin"
 
 
 def set_user_script(user_id: int, script: str):
-    ensure_user(user_id)
     if script not in ("latin", "cyrillic"):
         script = "latin"
-    execute_query("UPDATE user_prefs SET script = %s WHERE user_id = %s", (script, user_id))
+    ensure_user(user_id)
+    execute_query("UPDATE user_prefs SET script = $1 WHERE user_id = $2", (script, user_id))
+    cached = USER_PREFS_CACHE.get(user_id, {"access_granted": 0})
+    USER_PREFS_CACHE[user_id] = {"script": script, "access_granted": int(cached.get("access_granted", 0))}
 
 
 def tr(user_id: int, text: str) -> str:
@@ -320,181 +374,186 @@ def normalize_subject_key(subject_key: str) -> str:
         return "general"
     return OLD_TO_NEW_SUBJECT.get(subject_key, subject_key)
 
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS votes (
-                        user_id BIGINT PRIMARY KEY,
-                        full_name TEXT,
-                        username TEXT,
-                        subject_key TEXT NOT NULL,
-                        teacher_key TEXT NOT NULL,
-                        voted_at TEXT
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS user_prefs (
-                        user_id BIGINT PRIMARY KEY,
-                        script TEXT DEFAULT 'latin',
-                        access_granted INTEGER DEFAULT 0
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS teacher_ratings (
-                        user_id BIGINT NOT NULL,
-                        full_name TEXT,
-                        username TEXT,
-                        subject_key TEXT NOT NULL,
-                        teacher_key TEXT NOT NULL,
-                        rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
-                        rated_at TEXT,
-                        PRIMARY KEY (user_id, subject_key, teacher_key)
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS complaints (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        full_name TEXT,
-                        username TEXT,
-                        type TEXT DEFAULT 'general',
-                        subject_key TEXT,
-                        teacher_key TEXT,
-                        message_text TEXT NOT NULL,
-                        created_at TEXT
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS db_subjects (
-                        subject_key TEXT PRIMARY KEY,
-                        subject_name TEXT NOT NULL,
-                        sort_order INTEGER DEFAULT 0
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS db_teachers (
-                        teacher_key TEXT NOT NULL,
-                        subject_key TEXT NOT NULL,
-                        teacher_name TEXT NOT NULL,
-                        student_count INTEGER DEFAULT 0,
-                        PRIMARY KEY (subject_key, teacher_key)
-                    )
-                """)
-        conn.commit()
+def apply_indexes():
+    with open(os.path.join(os.path.dirname(__file__), "migrations_indexes.sql"), "r", encoding="utf-8") as f:
+        execute_query(f.read())
 
-        # Mavjud jadvallar uchun user_id ustunini BIGINT ga o'tkazish
-        # (eski deployda INTEGER bo'lib qolgan bo'lishi mumkin)
-        with conn:
-            with conn.cursor() as cur:
-                for alter_sql in [
-                    "ALTER TABLE votes ALTER COLUMN user_id TYPE BIGINT",
-                    "ALTER TABLE user_prefs ALTER COLUMN user_id TYPE BIGINT",
-                    "ALTER TABLE teacher_ratings ALTER COLUMN user_id TYPE BIGINT",
-                    "ALTER TABLE complaints ALTER COLUMN user_id TYPE BIGINT",
-                ]:
-                    try:
-                        cur.execute(alter_sql)
-                    except Exception:
-                        pass
-        conn.commit()
-    finally:
-        conn.close()
+
+def load_settings_cache() -> None:
+    SETTINGS_CACHE.clear()
+    rows = execute_query_plain("SELECT key, value FROM settings", fetch='all') or []
+    for key, value in rows:
+        SETTINGS_CACHE[key] = value
+
+def init_db():
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS votes (
+            user_id BIGINT PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            subject_key TEXT NOT NULL,
+            teacher_key TEXT NOT NULL,
+            voted_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            user_id BIGINT PRIMARY KEY,
+            script TEXT DEFAULT 'latin',
+            access_granted INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS teacher_ratings (
+            user_id BIGINT NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            subject_key TEXT NOT NULL,
+            teacher_key TEXT NOT NULL,
+            rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
+            rated_at TEXT,
+            PRIMARY KEY (user_id, subject_key, teacher_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS complaints (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            type TEXT DEFAULT 'general',
+            subject_key TEXT,
+            teacher_key TEXT,
+            message_text TEXT NOT NULL,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS db_subjects (
+            subject_key TEXT PRIMARY KEY,
+            subject_name TEXT NOT NULL,
+            sort_order INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS db_teachers (
+            teacher_key TEXT NOT NULL,
+            subject_key TEXT NOT NULL,
+            teacher_name TEXT NOT NULL,
+            student_count INTEGER DEFAULT 0,
+            PRIMARY KEY (subject_key, teacher_key)
+        );
+    """)
+
+    # Mavjud jadvallar uchun user_id ustunini BIGINT ga o'tkazish
+    for alter_sql in [
+        "ALTER TABLE votes ALTER COLUMN user_id TYPE BIGINT",
+        "ALTER TABLE user_prefs ALTER COLUMN user_id TYPE BIGINT",
+        "ALTER TABLE teacher_ratings ALTER COLUMN user_id TYPE BIGINT",
+        "ALTER TABLE complaints ALTER COLUMN user_id TYPE BIGINT",
+    ]:
+        try:
+            execute_query(alter_sql)
+        except Exception:
+            pass
 
     migrate_old_subject_keys()
     _sync_subjects_to_db()
-    if get_setting("voting_open", "") == "":
-        set_setting("voting_open", "1")
-    if get_setting("auto_voting_enabled", "") == "":
-        set_setting("auto_voting_enabled", "0")
-    if get_setting("auto_voting_start", "") == "":
-        set_setting("auto_voting_start", "09:00")
-    if get_setting("auto_voting_end", "") == "":
-        set_setting("auto_voting_end", "18:00")
+    apply_indexes()
+    load_settings_cache()
+    defaults = {
+        "voting_open": "1",
+        "auto_voting_enabled": "0",
+        "auto_voting_start": "09:00",
+        "auto_voting_end": "18:00",
+    }
+    for key, value in defaults.items():
+        if get_setting(key, "") == "":
+            set_setting(key, value)
+    load_settings_cache()
+    get_subjects_from_db(force=True)
 
 
 def _sync_subjects_to_db():
     row = execute_query_plain("SELECT COUNT(*) FROM db_subjects", fetch='one')
     count = row[0] if row else 0
     if count == 0:
-        conn = psycopg2.connect(DATABASE_URL)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    for i, (skey, sdata) in enumerate(SUBJECTS.items()):
-                        cur.execute(
-                            "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                            (skey, sdata["name"], i)
-                        )
-                        for tkey, tname in sdata["teachers"].items():
-                            cur.execute(
-                                "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                                (tkey, skey, tname)
-                            )
-        finally:
-            conn.close()
+        for i, (skey, sdata) in enumerate(SUBJECTS.items()):
+            execute_query(
+                "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                (skey, sdata["name"], i)
+            )
+            for tkey, tname in sdata["teachers"].items():
+                execute_query(
+                    "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    (tkey, skey, tname)
+                )
+    invalidate_subjects_cache()
 
 
-def get_subjects_from_db() -> dict:
+def get_subjects_from_db(force: bool = False) -> dict:
+    if not force and "subjects" in SUBJECTS_CACHE:
+        return SUBJECTS_CACHE["subjects"]
     rows = execute_query_plain("SELECT subject_key, subject_name FROM db_subjects ORDER BY sort_order, subject_key", fetch='all')
     subjects = {}
     if rows:
         for skey, sname in rows:
             subjects[skey] = {"name": sname, "teachers": {}}
-    for skey in subjects:
-        trows = execute_query_plain(
-            "SELECT teacher_key, teacher_name FROM db_teachers WHERE subject_key = %s ORDER BY teacher_key",
-            (skey,), fetch='all'
-        )
-        if trows:
-            for tkey, tname in trows:
-                subjects[skey]["teachers"][tkey] = tname
+    teacher_rows = execute_query_plain(
+        "SELECT subject_key, teacher_key, teacher_name, COALESCE(student_count, 0) FROM db_teachers ORDER BY subject_key, teacher_key",
+        fetch='all'
+    ) or []
+    for skey, tkey, tname, student_count in teacher_rows:
+        if skey not in subjects:
+            subjects[skey] = {"name": skey, "teachers": {}}
+        subjects[skey]["teachers"][tkey] = tname
+        subjects[skey].setdefault("student_counts", {})[tkey] = int(student_count or 0)
+    SUBJECTS_CACHE["subjects"] = subjects
     return subjects
 
 
 def migrate_old_subject_keys():
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
-                    cur.execute("UPDATE votes SET subject_key = %s WHERE subject_key = %s", (new_key, old_key))
-                    cur.execute("UPDATE teacher_ratings SET subject_key = %s WHERE subject_key = %s", (new_key, old_key))
-    finally:
-        conn.close()
+    for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
+        execute_query("UPDATE votes SET subject_key = $1 WHERE subject_key = $2", (new_key, old_key))
+        execute_query("UPDATE teacher_ratings SET subject_key = $1 WHERE subject_key = $2", (new_key, old_key))
 
 
 def get_setting(key: str, default: str = "") -> str:
-    row = execute_query_plain("SELECT value FROM settings WHERE key = %s", (key,), fetch='one')
-    return row[0] if row else default
+    if key in SETTINGS_CACHE:
+        return SETTINGS_CACHE.get(key, default)
+    row = execute_query_plain("SELECT value FROM settings WHERE key = $1", (key,), fetch='one')
+    if row:
+        SETTINGS_CACHE[key] = row[0]
+        return row[0]
+    return default
 
 
 def set_setting(key: str, value: str):
     execute_query(
-        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         (key, value)
     )
+    SETTINGS_CACHE[key] = value
 
 
 def ensure_user(user_id: int):
+    if user_id in USER_PREFS_CACHE:
+        return
     execute_query(
-        "INSERT INTO user_prefs (user_id, script, access_granted) VALUES (%s, 'latin', 0) ON CONFLICT (user_id) DO NOTHING",
+        "INSERT INTO user_prefs (user_id, script, access_granted) VALUES ($1, 'latin', 0) ON CONFLICT (user_id) DO NOTHING",
         (user_id,)
     )
+    row = execute_query_plain("SELECT script, access_granted FROM user_prefs WHERE user_id = $1", (user_id,), fetch='one')
+    if row:
+        USER_PREFS_CACHE[user_id] = {"script": row[0] or "latin", "access_granted": int(row[1] or 0)}
+    else:
+        USER_PREFS_CACHE[user_id] = {"script": "latin", "access_granted": 0}
 
 
 def has_access(user_id: int) -> bool:
     ensure_user(user_id)
-    row = execute_query_plain("SELECT access_granted FROM user_prefs WHERE user_id = %s", (user_id,), fetch='one')
-    return bool(row[0]) if row else False
+    cached = USER_PREFS_CACHE.get(user_id, {})
+    return bool(cached.get("access_granted", 0))
 
 
 def require_access_only(user_id: int) -> bool:
@@ -503,12 +562,16 @@ def require_access_only(user_id: int) -> bool:
 
 def grant_access(user_id: int):
     ensure_user(user_id)
-    execute_query("UPDATE user_prefs SET access_granted = 1 WHERE user_id = %s", (user_id,))
+    execute_query("UPDATE user_prefs SET access_granted = 1 WHERE user_id = $1", (user_id,))
+    cached = USER_PREFS_CACHE.get(user_id, {"script": "latin"})
+    USER_PREFS_CACHE[user_id] = {"script": cached.get("script", "latin"), "access_granted": 1}
 
 
 def reset_access(user_id: int):
     ensure_user(user_id)
-    execute_query("UPDATE user_prefs SET access_granted = 0 WHERE user_id = %s", (user_id,))
+    execute_query("UPDATE user_prefs SET access_granted = 0 WHERE user_id = $1", (user_id,))
+    cached = USER_PREFS_CACHE.get(user_id, {"script": "latin"})
+    USER_PREFS_CACHE[user_id] = {"script": cached.get("script", "latin"), "access_granted": 0}
 
 
 def is_admin(user_id: int) -> bool:
@@ -602,64 +665,79 @@ def has_voted(user_id: int) -> bool:
 
 def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
     subject_key = normalize_subject_key(subject_key)
-    conn = psycopg2.connect(DATABASE_URL)
     try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (user_id, full_name, username, subject_key, teacher_key, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
-                )
+        execute_query(
+            """
+            INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            (user_id, full_name, username, subject_key, teacher_key, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        invalidate_stats_cache()
         return True
     except PgIntegrityError:
-        conn.rollback()
         return False
-    finally:
-        conn.close()
 
 
 def get_total_votes(subject_key: Optional[str] = None) -> int:
+    cache_key = f"total_votes:{normalize_subject_key(subject_key) if subject_key else 'all'}"
+    if cache_key in STATS_CACHE:
+        return int(STATS_CACHE[cache_key])
     if subject_key:
         row = execute_query_plain(
-            "SELECT COUNT(*) FROM votes WHERE subject_key = %s",
+            "SELECT COUNT(*) FROM votes WHERE subject_key = $1",
             (normalize_subject_key(subject_key),), fetch='one'
         )
     else:
         row = execute_query_plain("SELECT COUNT(*) FROM votes", fetch='one')
-    return row[0] if row else 0
+    value = int(row[0] or 0) if row else 0
+    STATS_CACHE[cache_key] = value
+    return value
 
+
+
+def get_vote_counts_map() -> dict[tuple[str, str], int]:
+    cache_key = "vote_counts_map"
+    if cache_key in STATS_CACHE:
+        return STATS_CACHE[cache_key]
+    rows = execute_query_plain(
+        "SELECT subject_key, teacher_key, COUNT(*) FROM votes GROUP BY subject_key, teacher_key",
+        fetch='all'
+    ) or []
+    result = {(normalize_subject_key(subject_key), teacher_key): int(count or 0) for subject_key, teacher_key, count in rows}
+    STATS_CACHE[cache_key] = result
+    return result
 
 def reset_votes():
     execute_query("DELETE FROM votes")
+    invalidate_stats_cache()
 
 
 def reset_ratings():
     execute_query("DELETE FROM teacher_ratings")
+    invalidate_stats_cache()
 
 
 def reset_complaints():
     execute_query("DELETE FROM complaints")
+    invalidate_stats_cache()
 
 
 def get_subject_name(subject_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    row = execute_query_plain("SELECT subject_name FROM db_subjects WHERE subject_key = %s", (subject_key,), fetch='one')
-    if row:
-        return row[0]
+    subject_key = normalize_subject_key(subject_key or "")
+    subjects = get_subjects_from_db()
+    if subject_key in subjects:
+        return subjects[subject_key].get("name", subject_key)
     return SUBJECTS.get(subject_key, {}).get("name", subject_key)
 
 
 def get_teacher_name(subject_key: str, teacher_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    row = execute_query_plain(
-        "SELECT teacher_name FROM db_teachers WHERE subject_key = %s AND teacher_key = %s",
-        (subject_key, teacher_key), fetch='one'
-    )
-    if row:
-        return row[0]
+    subject_key = normalize_subject_key(subject_key or "")
+    subjects = get_subjects_from_db()
+    if subject_key in subjects:
+        name = subjects[subject_key].get("teachers", {}).get(teacher_key)
+        if name:
+            return name
     return SUBJECTS.get(subject_key, {}).get("teachers", {}).get(teacher_key, teacher_key)
 
 
@@ -670,21 +748,21 @@ def build_progress_bar(percent: float, length: int = 14) -> str:
 
 
 def get_teacher_student_count(subject_key: str, teacher_key: str) -> int:
-    subject_key = normalize_subject_key(subject_key)
-    row = execute_query_plain(
-        "SELECT COALESCE(student_count, 0) FROM db_teachers WHERE subject_key = %s AND teacher_key = %s",
-        (subject_key, teacher_key), fetch='one'
-    )
-    return int(row[0] or 0) if row else 0
+    subject_key = normalize_subject_key(subject_key or "")
+    subjects = get_subjects_from_db()
+    if subject_key in subjects:
+        return int(subjects[subject_key].get("student_counts", {}).get(teacher_key, 0) or 0)
+    return 0
 
 
 def set_teacher_student_count(subject_key: str, teacher_key: str, student_count: int) -> bool:
     subject_key = normalize_subject_key(subject_key)
     student_count = max(0, int(student_count))
     rowcount = execute_query(
-        "UPDATE db_teachers SET student_count = %s WHERE subject_key = %s AND teacher_key = %s",
+        "UPDATE db_teachers SET student_count = $1 WHERE subject_key = $2 AND teacher_key = $3",
         (student_count, subject_key, teacher_key)
     )
+    invalidate_subjects_cache()
     return rowcount > 0
 
 
@@ -724,6 +802,7 @@ def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key
         """,
         (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
     )
+    invalidate_stats_cache()
 
 
 def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) -> Optional[str]:
@@ -755,9 +834,26 @@ def get_rating_counts(subject_key: str, teacher_key: str):
 
 
 def rating_rows():
+    cache_key = "rating_rows"
+    if cache_key in STATS_CACHE:
+        return STATS_CACHE[cache_key]
+    db_rows = execute_query_plain(
+        """
+        SELECT subject_key, teacher_key,
+               SUM(CASE WHEN rating = 'like' THEN 1 ELSE 0 END) AS likes,
+               SUM(CASE WHEN rating = 'dislike' THEN 1 ELSE 0 END) AS dislikes,
+               COUNT(*) AS total
+        FROM teacher_ratings
+        GROUP BY subject_key, teacher_key
+        """,
+        fetch='all'
+    ) or []
+    counts = {(normalize_subject_key(s), t): (int(l or 0), int(d or 0), int(total or 0)) for s, t, l, d, total in db_rows}
     rows = []
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
+        like_count, dislike_count, total = counts.get((subject_key, teacher_key), (0, 0, 0))
+        like_percent = (like_count / total * 100) if total else 0
+        dislike_percent = (dislike_count / total * 100) if total else 0
         rows.append({
             "subject_key": subject_key,
             "subject_name": get_subject_name(subject_key),
@@ -769,6 +865,7 @@ def rating_rows():
             "like_percent": like_percent,
             "dislike_percent": dislike_percent,
         })
+    STATS_CACHE[cache_key] = rows
     return rows
 
 
@@ -793,6 +890,7 @@ def save_complaint(user_id: int, full_name: str, username: str, message_text: st
             uz_now().strftime("%Y-%m-%d %H:%M:%S")
         )
     )
+    invalidate_stats_cache()
 
 
 def get_last_complaint_for_user(user_id: int):
@@ -1166,12 +1264,9 @@ def get_top_ratings_text(user_id: int) -> str:
 
 def get_top_votes_text(user_id: int) -> str:
     items = []
+    counts = get_vote_counts_map()
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        row = execute_query_plain(
-            "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-            (subject_key, teacher_key), fetch='one'
-        )
-        vote_count = row[0] if row else 0
+        vote_count = counts.get((subject_key, teacher_key), 0)
         student_count = get_teacher_student_count(subject_key, teacher_key)
         participation = get_teacher_participation_percent(subject_key, teacher_key, vote_count)
         items.append((subject_key, teacher_key, teacher_name, vote_count, student_count, participation))
@@ -1206,6 +1301,7 @@ def get_top_votes_text(user_id: int) -> str:
 def get_top_votes_by_subject_text(user_id: int) -> str:
     subjects = get_subjects_from_db()
     total_votes = get_total_votes()
+    counts = get_vote_counts_map()
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
     subject_rows = []
@@ -1213,12 +1309,8 @@ def get_top_votes_by_subject_text(user_id: int) -> str:
         teacher_results = []
         subject_vote_count = 0
         teachers = subject_data.get("teachers", {})
-        for teacher_key, _teacher_name in teachers.items():
-            row = execute_query_plain(
-                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-                (subject_key, teacher_key), fetch='one'
-            )
-            vote_count = row[0] if row else 0
+        for teacher_key in teachers.keys():
+            vote_count = counts.get((subject_key, teacher_key), 0)
             subject_vote_count += vote_count
             teacher_results.append(get_teacher_participation_percent(subject_key, teacher_key, vote_count))
 
@@ -3304,31 +3396,35 @@ def db_add_subject(subject_key: str, subject_name: str) -> bool:
         row = execute_query_plain("SELECT MAX(sort_order) FROM db_subjects", fetch='one')
         max_order = (row[0] or 0) + 1
         execute_query(
-            "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (%s, %s, %s)",
+            "INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES ($1, $2, $3)",
             (subject_key, subject_name, max_order)
         )
+        invalidate_subjects_cache()
         return True
     except PgIntegrityError:
         return False
 
 
 def db_edit_subject(subject_key: str, new_name: str) -> bool:
-    rowcount = execute_query("UPDATE db_subjects SET subject_name = %s WHERE subject_key = %s", (new_name, subject_key))
+    rowcount = execute_query("UPDATE db_subjects SET subject_name = $1 WHERE subject_key = $2", (new_name, subject_key))
+    invalidate_subjects_cache()
     return rowcount > 0
 
 
 def db_delete_subject(subject_key: str) -> bool:
-    execute_query("DELETE FROM db_teachers WHERE subject_key = %s", (subject_key,))
-    execute_query("DELETE FROM db_subjects WHERE subject_key = %s", (subject_key,))
+    execute_query("DELETE FROM db_teachers WHERE subject_key = $1", (subject_key,))
+    execute_query("DELETE FROM db_subjects WHERE subject_key = $1", (subject_key,))
+    invalidate_subjects_cache()
     return True
 
 
 def db_add_teacher(subject_key: str, teacher_key: str, teacher_name: str) -> bool:
     try:
         execute_query(
-            "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (%s, %s, %s)",
+            "INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES ($1, $2, $3)",
             (teacher_key, subject_key, teacher_name)
         )
+        invalidate_subjects_cache()
         return True
     except PgIntegrityError:
         return False
@@ -3336,21 +3432,23 @@ def db_add_teacher(subject_key: str, teacher_key: str, teacher_name: str) -> boo
 
 def db_edit_teacher(subject_key: str, teacher_key: str, new_name: str) -> bool:
     rowcount = execute_query(
-        "UPDATE db_teachers SET teacher_name = %s WHERE subject_key = %s AND teacher_key = %s",
+        "UPDATE db_teachers SET teacher_name = $1 WHERE subject_key = $2 AND teacher_key = $3",
         (new_name, subject_key, teacher_key)
     )
+    invalidate_subjects_cache()
     return rowcount > 0
 
 
 def db_delete_teacher(subject_key: str, teacher_key: str) -> bool:
-    rowcount = execute_query("DELETE FROM db_teachers WHERE subject_key = %s AND teacher_key = %s", (subject_key, teacher_key))
+    rowcount = execute_query("DELETE FROM db_teachers WHERE subject_key = $1 AND teacher_key = $2", (subject_key, teacher_key))
+    invalidate_subjects_cache()
     return rowcount > 0
 
 
 def generate_teacher_key(subject_key: str) -> str:
     prefix = subject_key[:3]
-    rows = execute_query_plain("SELECT teacher_key FROM db_teachers WHERE subject_key = %s", (subject_key,), fetch='all') or []
-    existing = {r[0] for r in rows}
+    subjects = get_subjects_from_db()
+    existing = set(subjects.get(subject_key, {}).get("teachers", {}).keys())
     i = 1
     while f"{prefix}_{i}" in existing:
         i += 1
@@ -3360,8 +3458,7 @@ def generate_teacher_key(subject_key: str) -> str:
 def generate_subject_key(name: str) -> str:
     import re as _re
     base = _re.sub(r"[^a-zA-Z0-9]", "", name.lower().replace(" ", "_"))[:8] or "subj"
-    rows = execute_query_plain("SELECT subject_key FROM db_subjects", fetch='all') or []
-    existing = {r[0] for r in rows}
+    existing = set(get_subjects_from_db().keys())
     key = base
     i = 1
     while key in existing:
@@ -3885,11 +3982,19 @@ async def text_handler(message: Message):
 # =========================
 # MAIN
 # =========================
-async def main():
-    init_db()
+async def on_startup():
+    await init_pool(DATABASE_URL, min_size=5, max_size=20, command_timeout=30)
+    await asyncio.to_thread(init_db)
     asyncio.create_task(auto_voting_scheduler())
-    logging.info("Bot ishga tushdi. PostgreSQL baza ulandi.")
-    await dp.start_polling(bot)
+    logging.info("Bot ishga tushdi. PostgreSQL asyncpg pool, cache va indexes tayyor.")
+
+
+async def main():
+    await on_startup()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_pool()
 
 if __name__ == "__main__":
     asyncio.run(main())
