@@ -182,6 +182,8 @@ dp = Dispatcher()
 # =========================
 SETTINGS_CACHE: TTLCache = TTLCache(maxsize=256, ttl=60)
 USER_PREFS_CACHE: TTLCache = TTLCache(maxsize=20000, ttl=300)
+SUBSCRIPTION_CACHE: TTLCache = TTLCache(maxsize=20000, ttl=600)
+VOTED_CACHE: TTLCache = TTLCache(maxsize=20000, ttl=300)
 SUBJECTS_CACHE: TTLCache = TTLCache(maxsize=4, ttl=60)
 STATS_CACHE: TTLCache = TTLCache(maxsize=512, ttl=60)
 
@@ -565,6 +567,7 @@ def grant_access(user_id: int):
     execute_query("UPDATE user_prefs SET access_granted = 1 WHERE user_id = $1", (user_id,))
     cached = USER_PREFS_CACHE.get(user_id, {"script": "latin"})
     USER_PREFS_CACHE[user_id] = {"script": cached.get("script", "latin"), "access_granted": 1}
+    SUBSCRIPTION_CACHE[user_id] = True
 
 
 def reset_access(user_id: int):
@@ -572,6 +575,7 @@ def reset_access(user_id: int):
     execute_query("UPDATE user_prefs SET access_granted = 0 WHERE user_id = $1", (user_id,))
     cached = USER_PREFS_CACHE.get(user_id, {"script": "latin"})
     USER_PREFS_CACHE[user_id] = {"script": cached.get("script", "latin"), "access_granted": 0}
+    SUBSCRIPTION_CACHE[user_id] = False
 
 
 def is_admin(user_id: int) -> bool:
@@ -659,8 +663,13 @@ async def auto_voting_scheduler():
 
 
 def has_voted(user_id: int) -> bool:
+    cached = VOTED_CACHE.get(user_id)
+    if cached is not None:
+        return bool(cached)
     row = execute_query_plain("SELECT 1 FROM votes WHERE user_id = %s", (user_id,), fetch='one')
-    return row is not None
+    voted = row is not None
+    VOTED_CACHE[user_id] = voted
+    return voted
 
 
 def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
@@ -674,8 +683,10 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
             (user_id, full_name, username, subject_key, teacher_key, uz_now().strftime("%Y-%m-%d %H:%M:%S"))
         )
         invalidate_stats_cache()
+        VOTED_CACHE[user_id] = True
         return True
     except PgIntegrityError:
+        VOTED_CACHE[user_id] = True
         return False
 
 
@@ -710,6 +721,7 @@ def get_vote_counts_map() -> dict[tuple[str, str], int]:
 
 def reset_votes():
     execute_query("DELETE FROM votes")
+    VOTED_CACHE.clear()
     invalidate_stats_cache()
 
 
@@ -1414,11 +1426,7 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
     if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
         return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
 
-    row = execute_query_plain(
-        "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-        (subject_key, teacher_key), fetch='one'
-    )
-    vote_count = row[0] if row else 0
+    vote_count = get_vote_counts_map().get((subject_key, teacher_key), 0)
     subject_total = get_total_votes(subject_key)
     total_votes = get_total_votes()
     vote_percent_subject = get_vote_percent(vote_count, subject_total)
@@ -1442,17 +1450,14 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
 def export_subjects_ranking_to_excel() -> str:
     total_votes = get_total_votes()
     subjects = get_subjects_from_db()
+    counts = get_vote_counts_map()
 
     subject_rows = []
     for subject_key, subject_data in subjects.items():
         teacher_rows = []
         subject_vote_count = 0
         for teacher_key, teacher_name in subject_data.get("teachers", {}).items():
-            row = execute_query_plain(
-                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-                (subject_key, teacher_key), fetch='one'
-            )
-            vote_count = row[0] if row else 0
+            vote_count = counts.get((subject_key, teacher_key), 0)
             student_count = get_teacher_student_count(subject_key, teacher_key)
             percent = round(get_teacher_participation_percent(subject_key, teacher_key, vote_count), 2)
             subject_vote_count += vote_count
@@ -1539,6 +1544,7 @@ def export_votes_to_excel() -> str:
         return export_votes_to_csv()
     wb = Workbook()
     wb.remove(wb.active)
+    counts = get_vote_counts_map()
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
@@ -1564,11 +1570,7 @@ def export_votes_to_excel() -> str:
     ws_append_header(ws, ["O'rin (Reyting)", "Kafedra", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Ishtirok foizi"])
     all_teachers_data = []
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        row = execute_query_plain(
-            "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-            (subject_key, teacher_key), fetch='one'
-        )
-        count = row[0] if row else 0
+        count = counts.get((subject_key, teacher_key), 0)
         scount = get_teacher_student_count(subject_key, teacher_key)
         percent = round(get_teacher_participation_percent(subject_key, teacher_key, count), 2)
         all_teachers_data.append((get_subject_name(subject_key), teacher_name, count, scount, percent))
@@ -1581,11 +1583,7 @@ def export_votes_to_excel() -> str:
         ws_append_header(ws, ["O'rin (Reyting)", "O'qituvchi", "Ovozlar", "O'quvchilar soni", "Ishtirok foizi"])
         subject_teachers_data = []
         for teacher_key, teacher_name in subject_data["teachers"].items():
-            row = execute_query_plain(
-                "SELECT COUNT(*) FROM votes WHERE subject_key = %s AND teacher_key = %s",
-                (subject_key, teacher_key), fetch='one'
-            )
-            count = row[0] if row else 0
+            count = counts.get((subject_key, teacher_key), 0)
             scount = get_teacher_student_count(subject_key, teacher_key)
             percent = round(get_teacher_participation_percent(subject_key, teacher_key, count), 2)
             subject_teachers_data.append((teacher_name, count, scount, percent))
@@ -1785,16 +1783,31 @@ def export_complaints_to_word() -> str:
 # =========================
 # SUBSCRIPTION
 # =========================
-async def check_user_subscription(user_id: int) -> bool:
+async def check_user_subscription(user_id: int, *, force: bool = False) -> bool:
+    if not force:
+        cached = SUBSCRIPTION_CACHE.get(user_id)
+        if cached is not None:
+            return bool(cached)
+        if has_access(user_id):
+            SUBSCRIPTION_CACHE[user_id] = True
+            return True
+
     try:
         member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
         if member.status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}:
+            SUBSCRIPTION_CACHE[user_id] = True
             return True
         if member.status == ChatMemberStatus.RESTRICTED:
-            return bool(getattr(member, "is_member", False))
+            ok = bool(getattr(member, "is_member", False))
+            SUBSCRIPTION_CACHE[user_id] = ok
+            return ok
+        SUBSCRIPTION_CACHE[user_id] = False
         return False
     except Exception as e:
         logging.error(f"Obunani tekshirishda xatolik: {e}")
+        if has_access(user_id):
+            SUBSCRIPTION_CACHE[user_id] = True
+            return True
         return False
 
 
@@ -2348,7 +2361,8 @@ async def admin_users_handler(message: Message):
     if not is_admin(user_id):
         await message.answer("Siz admin emassiz.")
         return
-    await message.answer(get_users_text(user_id), parse_mode="HTML", reply_markup=users_keyboard_admin(user_id))
+    text = await asyncio.to_thread(get_users_text, user_id)
+    await message.answer(text, parse_mode="HTML", reply_markup=users_keyboard_admin(user_id))
 
 
 @dp.message(Command("export"))
@@ -2357,7 +2371,7 @@ async def admin_export_handler(message: Message):
     if not is_admin(user_id):
         await message.answer("Siz admin emassiz.")
         return
-    filename = export_votes_to_excel()
+    filename = await asyncio.to_thread(export_votes_to_excel)
     await message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
 
 
@@ -2527,12 +2541,13 @@ async def confirm_complaint_send_handler(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Yuboriladigan matn topilmadi."), show_alert=True)
         return
     text = state.get("text", "")
-    allowed, reason = complaint_allowed(user_id, text, state.get("mode", "general"))
+    allowed, reason = await asyncio.to_thread(complaint_allowed, user_id, text, state.get("mode", "general"))
     if not allowed:
         await callback.answer(tr(user_id, reason), show_alert=True)
         return
     async with db_lock:
-        save_complaint(
+        await asyncio.to_thread(
+            save_complaint,
             user_id=user_id,
             full_name=callback.from_user.full_name or "Noma'lum",
             username=callback.from_user.username or "",
@@ -2575,7 +2590,7 @@ async def check_subscription_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     ensure_user(user_id)
 
-    ok = await check_user_subscription(user_id)
+    ok = await check_user_subscription(user_id, force=True)
     if not ok:
         reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
@@ -2595,13 +2610,13 @@ async def check_subscription_handler(callback: CallbackQuery):
 async def go_vote_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    if not await check_user_subscription(user_id):
-        reset_access(user_id)
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-
-    grant_access(user_id)
+    if not has_access(user_id):
+        if not await check_user_subscription(user_id):
+            reset_access(user_id)
+            await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
+            await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+            return
+        grant_access(user_id)
     if has_voted(user_id):
         await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
         await callback.answer()
@@ -2698,7 +2713,8 @@ async def confirm_vote_handler(callback: CallbackQuery):
         pass
 
     async with db_lock:
-        saved = save_vote(
+        saved = await asyncio.to_thread(
+            save_vote,
             user_id=user_id,
             full_name=callback.from_user.full_name or "Noma'lum",
             username=callback.from_user.username or "",
@@ -2752,8 +2768,8 @@ async def show_results_menu_user(callback: CallbackQuery):
 @dp.callback_query(F.data == "show_results_user:general")
 async def show_results_user_general(callback: CallbackQuery):
     user_id = callback.from_user.id
-    async with db_lock:
-        text = add_refresh_time(get_general_results_text(user_id), user_id)
+    text = await asyncio.to_thread(get_general_results_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
     await callback.answer()
 
@@ -2767,9 +2783,12 @@ async def show_results_user(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
 
-    async with db_lock:
-        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text, user_id)
+    text = await asyncio.to_thread(
+        get_general_results_text if scope == "general" else get_subject_results_text,
+        user_id,
+        *(() if scope == "general" else (scope,))
+    )
+    text = add_refresh_time(text, user_id)
 
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     await callback.answer()
@@ -2786,8 +2805,8 @@ async def refresh_results_user_general(callback: CallbackQuery):
 
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_general_results_text(user_id), user_id)
+        text = await asyncio.to_thread(get_general_results_text, user_id)
+        text = add_refresh_time(text, user_id)
         await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -2810,9 +2829,12 @@ async def refresh_results_user(callback: CallbackQuery):
             await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
             return
 
-        async with db_lock:
-            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text, user_id)
+        text = await asyncio.to_thread(
+            get_general_results_text if scope == "general" else get_subject_results_text,
+            user_id,
+            *(() if scope == "general" else (scope,))
+        )
+        text = add_refresh_time(text, user_id)
 
         await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     finally:
@@ -2826,8 +2848,8 @@ async def user_top_votes_callback(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="user_top_votes"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "📊 Natijalar"), callback_data="show_results_menu_user"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    async with db_lock:
-        text = add_refresh_time(get_top_votes_text(user_id), user_id)
+    text = await asyncio.to_thread(get_top_votes_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
@@ -2961,9 +2983,8 @@ async def show_results_admin_general(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    async with db_lock:
-        text = get_general_results_text(user_id)
-        text = add_refresh_time(text, user_id)
+    text = await asyncio.to_thread(get_general_results_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer()
 
@@ -2983,9 +3004,8 @@ async def refresh_results_admin_general(callback: CallbackQuery):
 
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = get_general_results_text(user_id)
-            text = add_refresh_time(text, user_id)
+        text = await asyncio.to_thread(get_general_results_text, user_id)
+        text = add_refresh_time(text, user_id)
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -3003,9 +3023,12 @@ async def show_results_admin(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
 
-    async with db_lock:
-        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text, user_id)
+    text = await asyncio.to_thread(
+        get_general_results_text if scope == "general" else get_subject_results_text,
+        user_id,
+        *(() if scope == "general" else (scope,))
+    )
+    text = add_refresh_time(text, user_id)
 
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     await callback.answer()
@@ -3032,9 +3055,12 @@ async def refresh_results_admin_handler(callback: CallbackQuery):
 
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text, user_id)
+        text = await asyncio.to_thread(
+            get_general_results_text if scope == "general" else get_subject_results_text,
+            user_id,
+            *(() if scope == "general" else (scope,))
+        )
+        text = add_refresh_time(text, user_id)
 
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     finally:
@@ -3067,8 +3093,8 @@ async def admin_top_votes_callback(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes"))
     kb.row(InlineKeyboardButton(text="⬅️ TOP menyusi", callback_data="admin_top_votes_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    async with db_lock:
-        text = add_refresh_time(get_top_votes_text(user_id), user_id)
+    text = await asyncio.to_thread(get_top_votes_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
@@ -3113,7 +3139,8 @@ async def teacher_stats_handler(callback: CallbackQuery):
         return
     _, subject_key, teacher_key = parts
     subject_key = normalize_subject_key(subject_key)
-    await safe_edit_message(callback, get_teacher_detailed_stats_text(user_id, subject_key, teacher_key), teacher_stats_keyboard(user_id, subject_key))
+    text = await asyncio.to_thread(get_teacher_detailed_stats_text, user_id, subject_key, teacher_key)
+    await safe_edit_message(callback, text, teacher_stats_keyboard(user_id, subject_key))
     await callback.answer()
 
 
@@ -3125,8 +3152,7 @@ async def admin_backup_handler(callback: CallbackQuery):
         return
     await callback.answer("Backup tayyorlanmoqda...")
     try:
-        async with db_lock:
-            backup_path = create_backup_zip()
+        backup_path = await asyncio.to_thread(create_backup_zip)
         await callback.message.answer_document(
             FSInputFile(backup_path),
             caption="💾 Backup: ovozlar Excel va shikoyatlar fayli."
@@ -3153,8 +3179,8 @@ async def admin_complaints_filtered_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     ctype = "suggestion" if callback.data == "admin_complaints_suggestions" else "teacher_complaint"
-    async with db_lock:
-        text = add_refresh_time(get_complaints_text_filtered(user_id, ctype), user_id)
+    text = await asyncio.to_thread(get_complaints_text_filtered, user_id, ctype)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, complaints_keyboard_admin(user_id, ctype))
     await callback.answer()
 
@@ -3175,8 +3201,8 @@ async def refresh_admin_complaints_callback(callback: CallbackQuery):
 
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_complaints_text_filtered(user_id, ctype), user_id)
+        text = await asyncio.to_thread(get_complaints_text_filtered, user_id, ctype)
+        text = add_refresh_time(text, user_id)
         await safe_edit_message(callback, text, complaints_keyboard_admin(user_id, ctype))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -3188,7 +3214,7 @@ async def admin_export_complaints_docx_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_complaints_to_docx()
+    filename = await asyncio.to_thread(export_complaints_to_docx)
     await callback.message.answer_document(
         FSInputFile(filename),
         caption="📄 Shikoyat va takliflar Word fayl ko'rinishida."
@@ -3202,7 +3228,7 @@ async def admin_export_teacher_complaints_excel_callback(callback: CallbackQuery
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_complaints_filtered_to_excel("teacher_complaint")
+    filename = await asyncio.to_thread(export_complaints_filtered_to_excel, "teacher_complaint")
     await callback.message.answer_document(FSInputFile(filename), caption="👤 O'qituvchi ustidan shikoyatlar fayli.")
     await callback.answer()
 
@@ -3213,7 +3239,7 @@ async def admin_export_suggestions_excel_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_complaints_filtered_to_excel("suggestion")
+    filename = await asyncio.to_thread(export_complaints_filtered_to_excel, "suggestion")
     await callback.message.answer_document(FSInputFile(filename), caption="💡 Takliflar fayli.")
     await callback.answer()
 
@@ -3224,7 +3250,7 @@ async def admin_export_subjects_excel_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_subjects_ranking_to_excel()
+    filename = await asyncio.to_thread(export_subjects_ranking_to_excel)
     await callback.message.answer_document(FSInputFile(filename), caption="🏫 Kafedralar natijasi Excel fayli.")
     await callback.answer()
 
@@ -3235,8 +3261,8 @@ async def admin_users_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    async with db_lock:
-        text = add_refresh_time(get_users_text(user_id), user_id)
+    text = await asyncio.to_thread(get_users_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer()
 
@@ -3256,8 +3282,8 @@ async def refresh_admin_users(callback: CallbackQuery):
 
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_users_text(user_id), user_id)
+        text = await asyncio.to_thread(get_users_text, user_id)
+        text = add_refresh_time(text, user_id)
         await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -3269,7 +3295,7 @@ async def admin_export_votes_excel_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_votes_to_excel()
+    filename = await asyncio.to_thread(export_votes_to_excel)
     await callback.message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
     await callback.answer()
 
@@ -3280,7 +3306,7 @@ async def admin_export_users_excel_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    filename = export_users_to_excel()
+    filename = await asyncio.to_thread(export_users_to_excel)
     await callback.message.answer_document(FSInputFile(filename), caption="👥 Foydalanuvchilar Excel fayli.")
     await callback.answer()
 
@@ -3335,7 +3361,7 @@ async def admin_reset_complaints_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        reset_complaints()
+        await asyncio.to_thread(reset_complaints)
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Shikoyat va takliflar tozalandi!")
 
@@ -3357,7 +3383,7 @@ async def admin_reset_votes_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        reset_votes()
+        await asyncio.to_thread(reset_votes)
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Ovozlar reset qilindi!")
 
@@ -3369,7 +3395,7 @@ async def admin_reset_rating_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        reset_ratings()
+        await asyncio.to_thread(reset_ratings)
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Rating reset qilindi!")
 
@@ -3585,8 +3611,8 @@ async def admin_top_votes_by_subject_callback(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes_by_subject"))
     kb.row(InlineKeyboardButton(text="⬅️ TOP menyusi", callback_data="admin_top_votes_menu"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    async with db_lock:
-        text = add_refresh_time(get_top_votes_by_subject_text(user_id), user_id)
+    text = await asyncio.to_thread(get_top_votes_by_subject_text, user_id)
+    text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
@@ -3690,7 +3716,7 @@ async def manage_subject_delete_callback(callback: CallbackQuery):
     subject_key = callback.data.split(":", 1)[1]
     sname = get_subject_name(subject_key)
     async with db_lock:
-        db_delete_subject(subject_key)
+        await asyncio.to_thread(db_delete_subject, subject_key)
     subjects = get_subjects_from_db()
     text = f"✅ <b>{sname}</b> bo'limi o'chirildi.\n\nJami: {len(subjects)} ta bo'lim"
     await safe_edit_message(callback, text, manage_subjects_keyboard(user_id))
@@ -3834,7 +3860,7 @@ async def manage_teacher_delete_callback(callback: CallbackQuery):
     _, subject_key, teacher_key = parts
     tname = get_teacher_name(subject_key, teacher_key)
     async with db_lock:
-        db_delete_teacher(subject_key, teacher_key)
+        await asyncio.to_thread(db_delete_teacher, subject_key, teacher_key)
     await safe_edit_message(callback,
         f"✅ <b>{tname}</b> o'chirildi.",
         manage_teachers_keyboard(user_id, subject_key))
@@ -3859,7 +3885,7 @@ async def text_handler(message: Message):
                 return
             skey = generate_subject_key(text)
             async with db_lock:
-                ok = db_add_subject(skey, text)
+                ok = await asyncio.to_thread(db_add_subject, skey, text)
             if ok:
                 await message.answer(
                     f"✅ <b>{text}</b> bo'limi qo'shildi!", parse_mode="HTML",
@@ -3876,7 +3902,7 @@ async def text_handler(message: Message):
                 await message.answer("Bo'sh nom kiritilmadi.")
                 return
             async with db_lock:
-                db_edit_subject(subject_key, text)
+                await asyncio.to_thread(db_edit_subject, subject_key, text)
             await message.answer(
                 f"✅ Bo'lim nomi <b>{text}</b> ga o'zgartirildi!", parse_mode="HTML",
                 reply_markup=manage_subjects_keyboard(user_id)
@@ -3890,7 +3916,7 @@ async def text_handler(message: Message):
                 return
             tkey = generate_teacher_key(subject_key)
             async with db_lock:
-                db_add_teacher(subject_key, tkey, text)
+                await asyncio.to_thread(db_add_teacher, subject_key, tkey, text)
             await message.answer(
                 f"✅ <b>{text}</b> o'qituvchi sifatida qo'shildi!", parse_mode="HTML",
                 reply_markup=manage_teachers_keyboard(user_id, subject_key)
@@ -3904,7 +3930,7 @@ async def text_handler(message: Message):
                 await message.answer("Bo'sh ism kiritilmadi.")
                 return
             async with db_lock:
-                db_edit_teacher(subject_key, teacher_key, text)
+                await asyncio.to_thread(db_edit_teacher, subject_key, teacher_key, text)
             await message.answer(
                 f"✅ O'qituvchi ismi <b>{text}</b> ga o'zgartirildi!", parse_mode="HTML",
                 reply_markup=manage_teachers_keyboard(user_id, subject_key)
@@ -3920,7 +3946,7 @@ async def text_handler(message: Message):
                 return
             student_count = int(text)
             async with db_lock:
-                set_teacher_student_count(subject_key, teacher_key, student_count)
+                await asyncio.to_thread(set_teacher_student_count, subject_key, teacher_key, student_count)
             await message.answer(
                 f"✅ O'quvchilar soni <b>{student_count}</b> qilib saqlandi!", parse_mode="HTML",
                 reply_markup=manage_teacher_actions_keyboard(user_id, subject_key, teacher_key)
@@ -3941,9 +3967,9 @@ async def text_handler(message: Message):
             start_time = f"{int(parts[0][0]):02d}:{parts[0][1]}"
             end_time = f"{int(parts[1][0]):02d}:{parts[1][1]}"
             async with db_lock:
-                set_auto_voting_schedule(start_time, end_time)
-                if is_auto_voting_enabled():
-                    apply_auto_voting_status()
+                await asyncio.to_thread(set_auto_voting_schedule, start_time, end_time)
+                if await asyncio.to_thread(is_auto_voting_enabled):
+                    await asyncio.to_thread(apply_auto_voting_status)
             await message.answer(
                 f"✅ Avtomatik vaqt saqlandi: <b>{start_time} - {end_time}</b>",
                 parse_mode="HTML",
