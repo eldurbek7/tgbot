@@ -45,6 +45,21 @@ Project files in the ZIP:
 
 ## Fixes applied
 
+### 0. Second-pass button latency fixes
+
+- Added `SUBSCRIPTION_CACHE` so normal user buttons no longer call Telegram `get_chat_member` every time.
+- `✅ Tekshirish` still forces a real subscription check.
+- Voting-critical buttons now force a real channel membership check:
+  - entering the voting panel (`go_vote_panel`);
+  - final vote confirmation (`confirm_vote:*`).
+- If a user leaves the channel after previously getting access, the bot resets their access and refuses the vote.
+- Added `VOTED_CACHE` for the frequent “has this user already voted?” query.
+- Moved heavy text/report builders to `asyncio.to_thread(...)` in callback handlers so Aiogram’s event loop is not blocked.
+- Moved Excel/DOCX/ZIP export generation to worker threads.
+- Removed read-only `db_lock` usage around results/TOP/users/complaints pages.
+- Kept write locks for destructive or state-changing operations, but moved their DB work to worker threads.
+- Optimized remaining export ranking counts by using one grouped vote-count map instead of per-teacher `COUNT(*)` queries.
+
 ### 1. psycopg2 removed
 
 - Removed `psycopg2-binary` from `requirements.txt`.

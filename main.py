@@ -1783,7 +1783,7 @@ def export_complaints_to_word() -> str:
 # =========================
 # SUBSCRIPTION
 # =========================
-async def check_user_subscription(user_id: int, *, force: bool = False) -> bool:
+async def check_user_subscription(user_id: int, *, force: bool = False, allow_cached_on_error: bool = True) -> bool:
     if not force:
         cached = SUBSCRIPTION_CACHE.get(user_id)
         if cached is not None:
@@ -1805,10 +1805,24 @@ async def check_user_subscription(user_id: int, *, force: bool = False) -> bool:
         return False
     except Exception as e:
         logging.error(f"Obunani tekshirishda xatolik: {e}")
-        if has_access(user_id):
+        if allow_cached_on_error and has_access(user_id):
             SUBSCRIPTION_CACHE[user_id] = True
             return True
         return False
+
+
+async def refresh_access_from_channel(user_id: int) -> bool:
+    """Force-check channel membership and update local access cache.
+
+    Used on voting-critical paths so a user who leaves the channel cannot vote
+    using an old cached access flag.
+    """
+    ok = await check_user_subscription(user_id, force=True, allow_cached_on_error=False)
+    if ok:
+        await asyncio.to_thread(grant_access, user_id)
+    else:
+        await asyncio.to_thread(reset_access, user_id)
+    return ok
 
 
 async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
@@ -2590,14 +2604,12 @@ async def check_subscription_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     ensure_user(user_id)
 
-    ok = await check_user_subscription(user_id, force=True)
+    ok = await refresh_access_from_channel(user_id)
     if not ok:
-        reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
         return
 
-    grant_access(user_id)
     await safe_edit_message(
         callback,
         "✅ <b>Obuna tasdiqlandi</b>\n\nEndi bosh menyudan bemalol foydalanishingiz mumkin:",
@@ -2610,13 +2622,10 @@ async def check_subscription_handler(callback: CallbackQuery):
 async def go_vote_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    if not has_access(user_id):
-        if not await check_user_subscription(user_id):
-            reset_access(user_id)
-            await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-            await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-            return
-        grant_access(user_id)
+    if not await refresh_access_from_channel(user_id):
+        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
+        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+        return
     if has_voted(user_id):
         await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
         await callback.answer()
@@ -2687,8 +2696,9 @@ async def vote_handler(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("confirm_vote:"))
 async def confirm_vote_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not require_access_only(user_id):
+    if not await refresh_access_from_channel(user_id):
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
         return
     if not is_voting_open():
         await callback.answer(tr(user_id, "Hozir ovoz berish yopilgan."), show_alert=True)
